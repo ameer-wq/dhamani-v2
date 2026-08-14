@@ -1,0 +1,49 @@
+{
+  "name": "dhamani",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": "24.19.0",
+    "pnpm": "11.21.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "typecheck": "turbo run typecheck && tsc -p tsconfig.tooling.json",
+    "test": "vitest run --reporter=json --outputFile=evidence/results/vitest.json",
+    "boundaries:check": "node --experimental-strip-types tooling/scripts/boundaries-check.ts",
+    "secrets:check": "node --experimental-strip-types tooling/scripts/secrets-check.ts",
+    "db:validate": "prisma validate --schema packages/db/prisma/schema.prisma && prisma generate --schema packages/db/prisma/schema.prisma",
+    "db:migrate:deploy": "prisma migrate deploy --schema packages/db/prisma/schema.prisma",
+    "mobile:typecheck": "pnpm --filter @dhamani/mobile run typecheck",
+    "mobile:doctor": "pnpm --filter @dhamani/mobile run doctor",
+    "mobile:export:ci": "pnpm --filter @dhamani/mobile run export:ci",
+    "toolchain:verify": "node --experimental-strip-types tooling/scripts/toolchain-verify.ts",
+    "spec000:zero-product-logic:verify": "node --experimental-strip-types tooling/scripts/zero-product-verify.ts",
+    "spec000:ci-definition:verify": "node --experimental-strip-types tooling/scripts/ci-definition-verify.ts",
+    "spec000:evidence:verify": "node --experimental-strip-types tooling/scripts/evidence-verify.ts",
+    "spec000:runtime:verify": "vitest run tooling/tests/runtime.integration.test.ts",
+    "spec000:readiness:verify": "node --experimental-strip-types tooling/scripts/readiness-probe.ts",
+    "spec000:github-protection:verify": "node --experimental-strip-types tooling/scripts/github-protection-verify.ts",
+    "spec000:migration:verify": "node --experimental-strip-types tooling/scripts/migration-probe.ts",
+    "ci:verify": "pnpm spec000:evidence:verify"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.10.13",
+    "@types/pg": "8.21.0",
+    "eslint": "10.8.1",
+    "prettier": "3.9.6",
+    "pg": "8.23.0",
+    "prisma": "7.9.1",
+    "tsx": "4.23.12",
+    "turbo": "2.10.10",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.10",
+    "yaml": "2.9.0"
+  }
+}

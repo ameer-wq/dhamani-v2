@@ -1,0 +1,51 @@
+name: SPEC-000 Verification
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [codex/spec-000-repository-bootstrap]
+
+permissions:
+  contents: read
+
+jobs:
+  spec000:
+    name: SPEC-000 Required Gate
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.5-alpine
+        env:
+          POSTGRES_USER: dhamani_ci
+          POSTGRES_PASSWORD: dhamani_ci_only
+          POSTGRES_DB: dhamani_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dhamani_ci -d dhamani_ci"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      DHAMANI_RUNTIME_MODE: test
+      DATABASE_URL: postgresql://dhamani_ci:dhamani_ci_only@localhost:5432/dhamani_ci
+      DHAMANI_PRIVATE_SENTINEL: ci-private-sentinel
+      PORT: 3000
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: corepack enable
+      - run: corepack prepare pnpm@11.21.0 --activate
+      - run: pnpm install --frozen-lockfile
+      - run: docker compose down --volumes --remove-orphans
+      - run: docker compose up --detach --wait postgres
+      - run: pnpm ci:verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spec000-evidence
+          path: evidence/results/

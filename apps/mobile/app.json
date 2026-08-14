@@ -1,0 +1,9 @@
+{
+  "expo": {
+    "name": "Dhamani Bootstrap",
+    "slug": "dhamani-bootstrap",
+    "version": "0.0.0",
+    "orientation": "portrait",
+    "platforms": ["ios", "android"]
+  }
+}
