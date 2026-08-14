@@ -26,7 +26,8 @@
     "spec000:ci-definition:verify": "node --experimental-strip-types tooling/scripts/ci-definition-verify.ts",
     "spec000:evidence:verify": "node --experimental-strip-types tooling/scripts/evidence-verify.ts",
     "spec000:runtime:verify": "vitest run tooling/tests/runtime.integration.test.ts",
-    "spec000:readiness:verify": "node --experimental-strip-types tooling/scripts/readiness-probe.ts",
+    "spec000:readiness:verify": "tsx tooling/scripts/readiness-probe.ts",
+    "spec000:github-protection:collect": "node --experimental-strip-types tooling/scripts/github-protection-verify.ts --collect",
     "spec000:github-protection:verify": "node --experimental-strip-types tooling/scripts/github-protection-verify.ts",
     "spec000:migration:verify": "node --experimental-strip-types tooling/scripts/migration-probe.ts",
     "ci:verify": "pnpm spec000:evidence:verify"
