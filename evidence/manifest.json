@@ -15,7 +15,10 @@
       "spec000_runtime_config_is_startup_immutable",
       "spec000_runtime_mode_request_inputs_have_no_authority"
     ],
-    "INV-000-008": ["spec000_production_testkit_absence"],
+    "INV-000-008": [
+      "spec000_production_testkit_absence",
+      "spec000_production_build_testkit_absence"
+    ],
     "INV-000-009": ["spec000_no_private_secret_public_env_surface"],
     "INV-000-010": ["spec000_secret_scan_is_required_gate"],
     "INV-000-011": ["spec000_frozen_lockfile_install"],
@@ -40,7 +43,43 @@
     "INV-000-025": ["spec000_env_files_are_gitignored"],
     "INV-000-026": ["spec000_production_rejects_dev_configuration"]
   },
+  "executionOrder": [
+    "pnpm install --frozen-lockfile",
+    "pnpm lint",
+    "pnpm typecheck",
+    "pnpm boundaries:check",
+    "pnpm test",
+    "pnpm build",
+    "pnpm db:validate",
+    "pnpm secrets:check",
+    "pnpm mobile:typecheck",
+    "pnpm mobile:doctor",
+    "pnpm mobile:export:ci",
+    "pnpm spec000:zero-product-logic:verify",
+    "pnpm spec000:ci-definition:verify",
+    "pnpm toolchain:verify",
+    "pnpm spec000:migration:verify",
+    "pnpm spec000:readiness:verify",
+    "pnpm spec000:build-artifacts:verify",
+    "pnpm spec000:github-protection:verify"
+  ],
   "evidence": {
+    "spec000_formatting_and_lint_policy": {
+      "kind": "static_validator",
+      "command": "pnpm lint"
+    },
+    "spec000_production_builds_succeed": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm build"
+    },
+    "spec000_generated_artifacts_are_ignored_and_clean": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm build"
+    },
+    "spec000_prisma_schema_validates_and_generates": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm db:validate"
+    },
     "spec000_no_product_logic_surface": {
       "kind": "static_validator",
       "command": "pnpm spec000:zero-product-logic:verify"
@@ -81,6 +120,10 @@
     "spec000_production_testkit_absence": {
       "kind": "static_validator",
       "command": "pnpm boundaries:check"
+    },
+    "spec000_production_build_testkit_absence": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm spec000:build-artifacts:verify"
     },
     "spec000_no_private_secret_public_env_surface": {
       "kind": "static_validator",

@@ -1,152 +1,215 @@
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fail, pass, readJson, root } from './lib.ts';
+import { spawnPackageManagerSync } from './package-manager.ts';
+import {
+  aggregatePasses,
+  evaluateEvidence,
+  registrySelfTestFixtures,
+  registrySelfTestResult,
+  summarizeRegistrySelfTest,
+  validateEvidenceManifest,
+  type CommandResult,
+  type EvidenceManifest,
+  type EvidenceResult,
+  type VitestReport,
+} from './evidence-core.ts';
 
-type Evidence = {
-  kind:
-    | 'automated_test'
-    | 'static_validator'
-    | 'build_or_migration_check'
-    | 'runtime_integration_check'
-    | 'external_platform_check';
-  command: string;
-};
-type Manifest = { invariants: Record<string, string[]>; evidence: Record<string, Evidence> };
-type Result = {
-  evidenceId: string;
-  exists: boolean;
-  executionStatus: 'passed' | 'failed' | 'missing' | 'skipped' | 'todo';
-  exitCode: number;
-  pass: boolean;
-  command: string;
-};
-const manifest = readJson<Manifest>('evidence/manifest.json');
-const allowed = new Set([
-  'automated_test',
-  'static_validator',
-  'build_or_migration_check',
-  'runtime_integration_check',
-  'external_platform_check',
+const selfEvidenceIds = new Set([
+  'spec000_evidence_registry_matches_executed_results',
+  'spec000_evidence_registry_self_test',
 ]);
-for (const [invariant, ids] of Object.entries(manifest.invariants)) {
-  if (ids.length === 0) fail(`${invariant} has no evidence`);
-  for (const id of ids) {
-    const evidence = manifest.evidence[id];
-    if (!evidence || !allowed.has(evidence.kind) || !evidence.command)
-      fail(`${invariant} references invalid evidence ${id}`);
-  }
+
+function syntheticVitest(manifest: EvidenceManifest): VitestReport {
+  const assertionResults = Object.entries(manifest.evidence)
+    .filter(([, evidence]) => evidence.kind === 'automated_test')
+    .map(([id]) => ({ fullName: `synthetic ${id}`, status: 'passed' }));
+  return {
+    success: true,
+    numPendingTests: 0,
+    numTodoTests: 0,
+    testResults: [{ assertionResults }],
+  };
 }
 
-function registrySelfTest(): void {
-  const reject = (fixture: { exists: boolean; status: string; raw?: boolean }) =>
-    !fixture.exists || fixture.status !== 'passed' || fixture.raw === false;
-  const fixtures = [
-    { exists: false, status: 'passed' },
-    { exists: true, status: 'skipped' },
-    { exists: true, status: 'todo' },
-    { exists: true, status: 'failed' },
-    { exists: true, status: 'passed', raw: false },
-  ];
-  if (!fixtures.every(reject)) fail('evidence registry self-test fixture accepted');
-}
-registrySelfTest();
-
-const commands = [
-  'pnpm install --frozen-lockfile',
-  'pnpm lint',
-  'pnpm typecheck',
-  'pnpm boundaries:check',
-  'pnpm test',
-  'pnpm build',
-  'pnpm db:validate',
-  'pnpm secrets:check',
-  'pnpm mobile:typecheck',
-  'pnpm mobile:doctor',
-  'pnpm mobile:export:ci',
-  'pnpm spec000:zero-product-logic:verify',
-  'pnpm spec000:ci-definition:verify',
-  'pnpm toolchain:verify',
-  'pnpm spec000:migration:verify',
-  'pnpm spec000:readiness:verify',
-  'pnpm spec000:github-protection:verify',
-];
-const commandResults = new Map<string, { exitCode: number; output: string }>();
-for (const command of commands) {
-  const [executable, ...args] = command.split(' ');
-  const runnable = process.platform === 'win32' && executable === 'pnpm' ? 'pnpm.cmd' : executable!;
-  try {
-    const output = execFileSync(runnable, args, {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
-    });
-    commandResults.set(command, { exitCode: 0, output });
-    console.log(output);
-  } catch (error) {
-    const failure = error as { status?: number; stdout?: string; stderr?: string };
-    const output = `${failure.stdout ?? ''}${failure.stderr ?? ''}`;
-    commandResults.set(command, { exitCode: failure.status ?? 1, output });
-    console.error(output);
-  }
+function selectedEvidenceEntries(manifest: EvidenceManifest, repositoryLocal: boolean) {
+  return Object.entries(manifest.evidence).filter(
+    ([id, evidence]) =>
+      !selfEvidenceIds.has(id) && (!repositoryLocal || evidence.kind !== 'external_platform_check'),
+  );
 }
 
-const vitest = JSON.parse(readFileSync(`${root}/evidence/results/vitest.json`, 'utf8')) as {
-  success: boolean;
-  numPendingTests: number;
-  numTodoTests: number;
-  testResults: Array<{ assertionResults: Array<{ fullName: string; status: string }> }>;
-};
-if (!vitest.success || vitest.numPendingTests !== 0 || vitest.numTodoTests !== 0)
-  fail('Vitest raw result failed or contains pending/todo tests');
-const assertions = new Map(
-  vitest.testResults.flatMap((suite) =>
-    suite.assertionResults.map((test) => [test.fullName, test.status] as const),
-  ),
-);
-const results: Result[] = [];
-for (const [id, evidence] of Object.entries(manifest.evidence)) {
-  if (
-    id === 'spec000_evidence_registry_matches_executed_results' ||
-    id === 'spec000_evidence_registry_self_test'
-  )
-    continue;
-  const commandResult = commandResults.get(evidence.command);
-  let passed = commandResult?.exitCode === 0;
-  if (evidence.kind === 'automated_test') {
-    const match = [...assertions.entries()].find(([name]) => name.endsWith(id));
-    passed = passed && match?.[1] === 'passed';
+function runDecisionFixture(targetCommand: string): never {
+  const manifest = readJson<EvidenceManifest>('evidence/manifest.json');
+  const scripts = readJson<{ scripts: Record<string, string> }>('package.json').scripts;
+  if (!['pnpm lint', 'pnpm build', 'pnpm db:validate'].includes(targetCommand)) {
+    console.error(JSON.stringify({ status: 'fixture-error', targetCommand }));
+    process.exit(2);
   }
-  results.push({
-    evidenceId: id,
+  const outcomes = new Map<string, CommandResult>(
+    manifest.executionOrder.map((command) => [command, { exitCode: 0, output: '' }]),
+  );
+  outcomes.set(targetCommand, { exitCode: 9, output: 'forced negative fixture' });
+  const vitest = syntheticVitest(manifest);
+  const entries = selectedEvidenceEntries(manifest, false);
+  const results = entries.map(([id, evidence]) =>
+    evaluateEvidence(id, evidence, scripts, outcomes, vitest),
+  );
+  const selfTest = registrySelfTestResult(manifest, scripts);
+  const manifestErrors = validateEvidenceManifest(manifest, scripts);
+  const accepted = aggregatePasses(
+    results,
+    outcomes,
+    manifest.executionOrder,
+    manifestErrors,
+    selfTest.pass,
+    vitest,
+  );
+  console.error(
+    JSON.stringify({ targetCommand, accepted, results: results.filter((row) => !row.pass) }),
+  );
+  process.exit(accepted ? 2 : 1);
+}
+
+function runSelfTestAcceptanceFixture(): never {
+  const manifest = readJson<EvidenceManifest>('evidence/manifest.json');
+  const scripts = readJson<{ scripts: Record<string, string> }>('package.json').scripts;
+  const fixtures = registrySelfTestFixtures(manifest, scripts);
+  fixtures[0] = {
+    ...fixtures[0]!,
+    rejected: false,
+    reason: 'deliberately accepted regression fixture',
+  };
+  const selfTest = summarizeRegistrySelfTest(fixtures);
+  const row: EvidenceResult = {
+    evidenceId: 'spec000_evidence_registry_self_test',
     exists: true,
-    executionStatus: passed ? 'passed' : 'failed',
-    exitCode: commandResult?.exitCode ?? 1,
-    pass: passed,
-    command: evidence.command,
-  });
+    executionStatus: selfTest.pass ? 'passed' : 'failed',
+    exitCode: selfTest.pass ? 0 : 1,
+    pass: selfTest.pass,
+    command: 'pnpm spec000:evidence:verify',
+    details: selfTest.fixtures,
+  };
+  console.error(JSON.stringify(row));
+  process.exit(row.pass ? 2 : 1);
 }
+
+const fixtureIndex = process.argv.indexOf('--decision-fixture-failing-command');
+if (fixtureIndex >= 0) runDecisionFixture(process.argv[fixtureIndex + 1] ?? '');
+if (process.argv.includes('--decision-fixture-self-test-accepts')) runSelfTestAcceptanceFixture();
+
+const completeWithLiveExternal = process.argv.includes('--complete-with-live-external');
+const repositoryLocal = !completeWithLiveExternal;
+if (
+  process.argv.some(
+    (argument) => argument.startsWith('--') && argument !== '--complete-with-live-external',
+  )
+)
+  fail('unsupported evidence verifier argument');
+
+mkdirSync(join(root, 'evidence/results'), { recursive: true });
+rmSync(join(root, 'evidence/results/vitest.json'), { force: true });
+rmSync(join(root, 'evidence/results/spec000-results.json'), { force: true });
+rmSync(join(root, 'evidence/results/github-main-protection.json'), { force: true });
+const manifest = readJson<EvidenceManifest>('evidence/manifest.json');
+const scripts = readJson<{ scripts: Record<string, string> }>('package.json').scripts;
+const manifestErrors = validateEvidenceManifest(manifest, scripts);
+if (manifestErrors.length > 0) {
+  writeFileSync(
+    join(root, 'evidence/results/spec000-results.json'),
+    JSON.stringify(
+      {
+        generatedAt: new Date().toISOString(),
+        scope: repositoryLocal ? 'repository-local' : 'complete-with-live-external',
+        completeCriticalEvidence: false,
+        manifestErrors,
+        results: [],
+      },
+      null,
+      2,
+    ),
+  );
+  fail(`evidence manifest invalid: ${manifestErrors.join('; ')}`);
+}
+
+const entries = selectedEvidenceEntries(manifest, repositoryLocal);
+const selectedCommands = manifest.executionOrder.filter((command) =>
+  entries.some(([, evidence]) => evidence.command === command),
+);
+const commandResults = new Map<string, CommandResult>();
+for (const command of selectedCommands) {
+  const args = command.replace(/^pnpm\s+/, '').split(/\s+/);
+  const result = spawnPackageManagerSync(args, {
+    cwd: root,
+    encoding: 'utf8',
+    env: process.env,
+  });
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+  const exitCode = result.status ?? 1;
+  commandResults.set(command, { exitCode, output });
+  if (exitCode === 0) console.log(output);
+  else console.error(output);
+}
+
+let vitest: VitestReport | undefined;
+try {
+  vitest = JSON.parse(
+    readFileSync(join(root, 'evidence/results/vitest.json'), 'utf8'),
+  ) as VitestReport;
+} catch {
+  vitest = undefined;
+}
+const results: EvidenceResult[] = entries.map(([id, evidence]) =>
+  evaluateEvidence(id, evidence, scripts, commandResults, vitest),
+);
+const selfTest = registrySelfTestResult(manifest, scripts);
 results.push({
   evidenceId: 'spec000_evidence_registry_self_test',
-  exists: true,
-  executionStatus: 'passed',
-  exitCode: 0,
-  pass: true,
+  exists: scripts['spec000:evidence:verify'] !== undefined,
+  executionStatus: selfTest.pass ? 'passed' : 'failed',
+  exitCode: selfTest.pass ? 0 : 1,
+  pass: selfTest.pass,
   command: 'pnpm spec000:evidence:verify',
+  details: selfTest.fixtures,
 });
-const allPassed = results.every((result) => result.pass);
+const aggregateBeforeOwnRow = aggregatePasses(
+  results,
+  commandResults,
+  selectedCommands,
+  manifestErrors,
+  selfTest.pass,
+  vitest,
+);
 results.push({
   evidenceId: 'spec000_evidence_registry_matches_executed_results',
-  exists: true,
-  executionStatus: allPassed ? 'passed' : 'failed',
-  exitCode: allPassed ? 0 : 1,
-  pass: allPassed,
+  exists: scripts['spec000:evidence:verify'] !== undefined,
+  executionStatus: aggregateBeforeOwnRow ? 'passed' : 'failed',
+  exitCode: aggregateBeforeOwnRow ? 0 : 1,
+  pass: aggregateBeforeOwnRow,
   command: 'pnpm spec000:evidence:verify',
 });
-mkdirSync(`${root}/evidence/results`, { recursive: true });
+const allPassed = results.every((result) => result.pass) && aggregateBeforeOwnRow;
+const deferredExternalEvidenceIds = repositoryLocal
+  ? Object.entries(manifest.evidence)
+      .filter(([, evidence]) => evidence.kind === 'external_platform_check')
+      .map(([id]) => id)
+  : [];
 writeFileSync(
-  `${root}/evidence/results/spec000-results.json`,
-  JSON.stringify({ generatedAt: new Date().toISOString(), results }, null, 2),
+  join(root, 'evidence/results/spec000-results.json'),
+  JSON.stringify(
+    {
+      generatedAt: new Date().toISOString(),
+      scope: repositoryLocal ? 'repository-local' : 'complete-with-live-external',
+      completeCriticalEvidence: !repositoryLocal && allPassed,
+      deferredExternalEvidenceIds,
+      commandResults: Object.fromEntries(
+        [...commandResults].map(([command, result]) => [command, { exitCode: result.exitCode }]),
+      ),
+      results,
+    },
+    null,
+    2,
+  ),
 );
 if (!allPassed)
   fail(
@@ -155,5 +218,9 @@ if (!allPassed)
       .map((result) => result.evidenceId)
       .join(', ')}`,
   );
-pass('spec000_evidence_registry_self_test');
-pass('spec000_evidence_registry_matches_executed_results', { count: results.length });
+pass('spec000_evidence_registry_self_test', { fixtures: selfTest.fixtures });
+pass('spec000_evidence_registry_matches_executed_results', {
+  count: results.length,
+  scope: repositoryLocal ? 'repository-local' : 'complete-with-live-external',
+  deferredExternalEvidenceIds,
+});

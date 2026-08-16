@@ -18,7 +18,6 @@ jobs:
       DATABASE_URL: postgresql://dhamani_dev:dhamani_dev_only@localhost:5432/dhamani_dev
       DHAMANI_PRIVATE_SENTINEL: ci-private-sentinel
       PORT: 3000
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

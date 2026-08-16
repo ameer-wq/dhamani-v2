@@ -1,6 +1,17 @@
 {
   "extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"],
   "generatedExclusions": ["packages/db/generated"],
+  "buildOutputExclusions": [
+    "apps/api/dist",
+    "apps/mobile/.expo",
+    "apps/mobile/.spec000-export",
+    "apps/admin/.next",
+    "packages/domain/dist",
+    "packages/contracts/dist",
+    "packages/config/dist",
+    "packages/db/dist",
+    "packages/observability/dist"
+  ],
   "production": [
     "apps/admin/app/layout.tsx",
     "apps/admin/app/page.tsx",

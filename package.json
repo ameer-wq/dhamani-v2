@@ -9,7 +9,7 @@
     "pnpm": "11.21.0"
   },
   "scripts": {
-    "build": "turbo run build",
+    "build": "node --experimental-strip-types tooling/scripts/build-clean-verify.ts",
     "lint": "eslint . && prettier --check .",
     "format": "prettier --write .",
     "typecheck": "turbo run typecheck && tsc -p tsconfig.tooling.json",
@@ -25,12 +25,13 @@
     "spec000:zero-product-logic:verify": "node --experimental-strip-types tooling/scripts/zero-product-verify.ts",
     "spec000:ci-definition:verify": "node --experimental-strip-types tooling/scripts/ci-definition-verify.ts",
     "spec000:evidence:verify": "node --experimental-strip-types tooling/scripts/evidence-verify.ts",
+    "spec000:evidence:verify:complete": "node --experimental-strip-types tooling/scripts/evidence-verify.ts --complete-with-live-external",
     "spec000:runtime:verify": "vitest run tooling/tests/runtime.integration.test.ts",
     "spec000:readiness:verify": "tsx --tsconfig apps/api/tsconfig.json tooling/scripts/readiness-probe.ts",
-    "spec000:github-protection:collect": "node --experimental-strip-types tooling/scripts/github-protection-verify.ts --collect",
     "spec000:github-protection:verify": "node --experimental-strip-types tooling/scripts/github-protection-verify.ts",
     "spec000:migration:verify": "node --experimental-strip-types tooling/scripts/migration-probe.ts",
-    "ci:verify": "pnpm spec000:evidence:verify"
+    "spec000:build-artifacts:verify": "node --experimental-strip-types tooling/scripts/build-artifacts-verify.ts",
+    "ci:verify": "node --experimental-strip-types tooling/scripts/evidence-verify.ts"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

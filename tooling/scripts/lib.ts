@@ -12,15 +12,35 @@ export function fail(message: string): never {
 export function pass(check: string, details: unknown = {}): void {
   console.log(JSON.stringify({ check, status: 'pass', details }));
 }
-export function walk(directory: string, extensions: readonly string[]): string[] {
-  const absolute = join(root, directory);
-  if (!existsSync(absolute)) return [];
-  return readdirSync(absolute).flatMap((name) => {
-    const path = join(absolute, name);
-    if (['node_modules', 'dist', '.next', '.expo', 'generated'].includes(name)) return [];
-    if (statSync(path).isDirectory()) return walk(relative(root, path), extensions);
-    return extensions.includes(extname(path)) || name.endsWith('.d.ts')
-      ? [relative(root, path).replaceAll('\\', '/')]
-      : [];
+function normalize(path: string): string {
+  return path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '');
+}
+
+function isExcluded(path: string, exclusions: readonly string[]): boolean {
+  const normalized = normalize(path);
+  return exclusions.some((entry) => {
+    const exclusion = normalize(entry);
+    return normalized === exclusion || normalized.startsWith(`${exclusion}/`);
   });
+}
+
+export function walk(
+  directory: string,
+  extensions: readonly string[],
+  options: { rootDirectory?: string; excludedPaths?: readonly string[] } = {},
+): string[] {
+  const rootDirectory = options.rootDirectory ?? root;
+  const exclusions = options.excludedPaths ?? [];
+  const absolute = join(rootDirectory, directory);
+  if (!existsSync(absolute)) return [];
+  return readdirSync(absolute)
+    .sort()
+    .flatMap((name) => {
+      const path = join(absolute, name);
+      const relativePath = normalize(relative(rootDirectory, path));
+      if (isExcluded(relativePath, exclusions)) return [];
+      if (statSync(path).isDirectory())
+        return walk(relativePath, extensions, { rootDirectory, excludedPaths: exclusions });
+      return extensions.includes(extname(path)) || name.endsWith('.d.ts') ? [relativePath] : [];
+    });
 }

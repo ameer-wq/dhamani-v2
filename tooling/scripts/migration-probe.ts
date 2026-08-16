@@ -1,6 +1,6 @@
-import { execFileSync } from 'node:child_process';
 import pg from 'pg';
 import { fail, pass } from './lib.ts';
+import { execPackageManagerSync } from './package-manager.ts';
 
 const url = process.env.DATABASE_URL;
 if (!url) fail('DATABASE_URL is required');
@@ -18,8 +18,7 @@ try {
 } finally {
   await client.end();
 }
-const pnpmExecutable = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
-execFileSync(pnpmExecutable, ['db:migrate:deploy'], { stdio: 'inherit', env: process.env });
+execPackageManagerSync(['db:migrate:deploy'], { stdio: 'inherit', env: process.env });
 const after = new pg.Client({ connectionString: url });
 await after.connect();
 try {
@@ -47,7 +46,7 @@ try {
 } finally {
   await after.end();
 }
-execFileSync(pnpmExecutable, ['db:migrate:deploy'], { stdio: 'inherit', env: process.env });
+execPackageManagerSync(['db:migrate:deploy'], { stdio: 'inherit', env: process.env });
 const finalClient = new pg.Client({ connectionString: url });
 await finalClient.connect();
 const count = await finalClient.query(

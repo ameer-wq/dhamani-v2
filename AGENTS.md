@@ -11,9 +11,12 @@
   `@dhamani/testkit`.
 - Verify with: `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm typecheck`, `pnpm test`,
   `pnpm build`, `pnpm boundaries:check`, `pnpm secrets:check`, `pnpm db:validate`,
-  `pnpm spec000:migration:verify`, `pnpm mobile:typecheck`, `pnpm mobile:doctor`,
-  `pnpm mobile:export:ci`, `pnpm spec000:ci-definition:verify`,
-  `pnpm spec000:evidence:verify`, `pnpm toolchain:verify`, and `pnpm ci:verify`.
+  `pnpm db:migrate:deploy`, `pnpm spec000:migration:verify`, `pnpm mobile:typecheck`,
+  `pnpm mobile:doctor`, `pnpm mobile:export:ci`,
+  `pnpm spec000:zero-product-logic:verify`, `pnpm spec000:ci-definition:verify`,
+  `pnpm spec000:build-artifacts:verify`, `pnpm spec000:evidence:verify`,
+  `pnpm toolchain:verify`, and `pnpm ci:verify`. The live external Founder-GO gate is
+  `pnpm spec000:github-protection:verify`; it is intentionally separate from repository-local CI.
 - `dhamani_bootstrap._migration_probe` is intentional infrastructure proof. Do not reset or drop
   a database merely to silence future Prisma drift. Do not replace `migrate deploy` with
   `db push`. If future Prisma tooling reports drift, stop and follow the frozen migration policy.

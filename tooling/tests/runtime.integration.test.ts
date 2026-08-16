@@ -15,6 +15,10 @@ describe('SPEC-000 runtime integration', () => {
       'COOKIE-SECRET-8a1',
       'BODY-SECRET-3c2',
       'CONFIG-SECRET-4d6',
+      'APIKEY-SECRET-5e7',
+      'Basic PROXY-SECRET-6f8',
+      'AWS-SESSION-SECRET-7a9',
+      'UNKNOWN-HEADER-SECRET-8b0',
     ];
     const output = new PassThrough();
     let logs = '';
@@ -38,12 +42,32 @@ describe('SPEC-000 runtime integration', () => {
         cookie: sentinels[1]!,
         'content-type': 'application/json',
         'x-request-id': 'request-safe-123',
+        'x-api-key': sentinels[4]!,
+        'proxy-authorization': sentinels[5]!,
+        'x-amz-security-token': sentinels[6]!,
+        'x-unknown-private-header': sentinels[7]!,
       },
       body: JSON.stringify({ value: sentinels[2] }),
     });
     await new Promise((resolve) => setTimeout(resolve, 25));
     for (const sentinel of sentinels) expect(logs).not.toContain(sentinel);
-    for (const safe of ['request-safe-123', 'dhamani-api', 'status', 'path', 'level'])
-      expect(logs).toContain(safe);
+    const records = logs
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const requestLog = records.find((record) => record.msg === 'request completed');
+    expect(requestLog).toMatchObject({
+      service: 'dhamani-api',
+      runtimeMode: 'test',
+      requestId: 'request-safe-123',
+      method: 'POST',
+      path: '/missing',
+      status: 404,
+      privateSentinel: '[REDACTED]',
+      msg: 'request completed',
+    });
+    expect(typeof requestLog?.time).toBe('string');
+    expect(typeof requestLog?.level).toBe('number');
   });
 });

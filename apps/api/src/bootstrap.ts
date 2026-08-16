@@ -21,7 +21,7 @@ export async function createApi(
       logger.info(
         {
           requestId,
-          req: { headers: req.headers, body: req.body },
+          method: req.method,
           path: req.path,
           status: res.statusCode,
           privateSentinel: config.privateSentinel,

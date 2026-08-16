@@ -6,7 +6,7 @@ export function createLogger(config: RuntimeConfig, destination?: pino.Destinati
     base: { service: 'dhamani-api', runtimeMode: config.runtimeMode },
     timestamp: pino.stdTimeFunctions.isoTime,
     redact: {
-      paths: ['req.headers.authorization', 'req.headers.cookie', 'req.body', 'privateSentinel'],
+      paths: ['req.headers', 'req.body', 'privateSentinel'],
       censor: '[REDACTED]',
     },
     serializers: {

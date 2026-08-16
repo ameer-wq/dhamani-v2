@@ -1,68 +1,84 @@
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { fail, pass } from './lib.ts';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fail, pass, root } from './lib.ts';
+import { queryGitHubProtection, validateGitHubProtection } from './github-protection-core.ts';
 
-type Protection = {
-  required_status_checks?: { strict?: boolean; contexts?: string[] };
-  enforce_admins?: { enabled?: boolean };
-  required_pull_request_reviews?: unknown;
-  allow_force_pushes?: { enabled?: boolean };
-  allow_deletions?: { enabled?: boolean };
-};
-const artifactPath = 'evidence/external/github-main-protection.json';
-let protection: Protection;
-if (process.argv.includes('--collect')) {
-  try {
-    protection = JSON.parse(
-      execFileSync('gh', ['api', 'repos/ameer-wq/dhamani-v2/branches/main/protection'], {
-        encoding: 'utf8',
-      }),
-    ) as Protection;
-  } catch (error) {
-    fail(`branch protection inaccessible: ${String(error)}`);
-  }
-  mkdirSync('evidence/external', { recursive: true });
+const evidenceId = 'spec000_github_branch_protection_verified';
+const artifactPath = join(root, 'evidence/results/github-main-protection.json');
+mkdirSync(join(root, 'evidence/results'), { recursive: true });
+
+if (process.argv.length > 2) {
   writeFileSync(
     artifactPath,
     JSON.stringify(
       {
-        collectedAt: new Date().toISOString(),
+        evidenceId,
+        exists: true,
+        generatedAt: new Date().toISOString(),
         repository: 'ameer-wq/dhamani-v2',
         branch: 'main',
-        collectionCommand: 'gh api repos/ameer-wq/dhamani-v2/branches/main/protection',
-        protection,
+        collectionCommand:
+          'gh api --hostname github.com repos/ameer-wq/dhamani-v2/branches/main/protection',
+        command: 'pnpm spec000:github-protection:verify',
+        executionStatus: 'failed',
+        exitCode: 1,
+        pass: false,
+        error: 'offline or fixture arguments are forbidden',
       },
       null,
       2,
     ),
   );
-} else {
-  try {
-    const artifact = JSON.parse(readFileSync(artifactPath, 'utf8')) as {
-      repository: string;
-      branch: string;
-      collectionCommand: string;
-      protection: Protection;
-    };
-    if (
-      artifact.repository !== 'ameer-wq/dhamani-v2' ||
-      artifact.branch !== 'main' ||
-      artifact.collectionCommand !== 'gh api repos/ameer-wq/dhamani-v2/branches/main/protection'
-    )
-      fail('branch protection artifact provenance mismatch');
-    protection = artifact.protection;
-  } catch (error) {
-    fail(`branch protection artifact missing or invalid: ${String(error)}`);
-  }
+  fail('GitHub protection verifier accepts no offline or fixture arguments');
 }
-if (protection.required_pull_request_reviews == null) fail('pull request reviews not required');
-if (protection.required_status_checks?.strict !== true) fail('strict status checks not enabled');
-if (!protection.required_status_checks.contexts?.includes('SPEC-000 Required Gate'))
-  fail('required check context missing');
-if (protection.enforce_admins?.enabled !== true) fail('admin enforcement disabled');
-if (protection.allow_force_pushes?.enabled !== false) fail('force pushes not disabled');
-if (protection.allow_deletions?.enabled !== false) fail('branch deletion not disabled');
-pass('spec000_github_branch_protection_verified', {
-  branch: 'main',
-  context: 'SPEC-000 Required Gate',
-});
+
+try {
+  const { raw, protection } = queryGitHubProtection();
+  validateGitHubProtection(protection);
+  writeFileSync(
+    artifactPath,
+    JSON.stringify(
+      {
+        evidenceId,
+        exists: true,
+        generatedAt: new Date().toISOString(),
+        repository: 'ameer-wq/dhamani-v2',
+        branch: 'main',
+        collectionCommand:
+          'gh api --hostname github.com repos/ameer-wq/dhamani-v2/branches/main/protection',
+        command: 'pnpm spec000:github-protection:verify',
+        executionStatus: 'passed',
+        exitCode: 0,
+        pass: true,
+        rawResponse: JSON.parse(raw) as unknown,
+      },
+      null,
+      2,
+    ),
+  );
+  pass(evidenceId, { branch: 'main', context: 'SPEC-000 Required Gate', live: true });
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  writeFileSync(
+    artifactPath,
+    JSON.stringify(
+      {
+        evidenceId,
+        exists: true,
+        generatedAt: new Date().toISOString(),
+        repository: 'ameer-wq/dhamani-v2',
+        branch: 'main',
+        collectionCommand:
+          'gh api --hostname github.com repos/ameer-wq/dhamani-v2/branches/main/protection',
+        command: 'pnpm spec000:github-protection:verify',
+        executionStatus: 'failed',
+        exitCode: 1,
+        pass: false,
+        error: message,
+      },
+      null,
+      2,
+    ),
+  );
+  fail(message);
+}

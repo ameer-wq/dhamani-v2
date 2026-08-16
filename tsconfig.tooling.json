@@ -7,5 +7,5 @@
     "emitDecoratorMetadata": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["tooling/**/*.ts"]
+  "include": ["tooling/**/*.ts", "prisma.config.ts", "vitest.config.ts"]
 }

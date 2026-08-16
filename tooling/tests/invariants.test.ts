@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { isDeepStrictEqual } from 'node:util';
 import { resolveRuntimeConfig } from '../../packages/config/src/index.ts';
+import { execPackageManagerSync } from '../scripts/package-manager.ts';
+import { verifyNoDbPush } from '../scripts/repository-policy.ts';
+import {
+  typescriptWorkspaces,
+  verifyWorkspaceTypeScriptFlags,
+} from '../scripts/tsconfig-policy.ts';
 
 const valid = {
   DHAMANI_RUNTIME_MODE: 'test',
@@ -55,14 +60,21 @@ describe('SPEC-000 critical invariants', () => {
     expect(() => execFileSync('git', ['check-ignore', '-q', '.env.example'])).toThrow();
   });
   it('spec000_no_db_push_in_production_or_ci', () => {
-    const manifest = JSON.parse(readFileSync('package.json', 'utf8')) as {
-      scripts: Record<string, string>;
-    };
-    expect(
-      Object.entries(manifest.scripts)
-        .filter(([name]) => name.includes('db'))
-        .every(([, value]) => !value.includes('db push')),
-    ).toBe(true);
+    const scanned = verifyNoDbPush(process.cwd());
+    // The scan must reach the root manifest, every workspace manifest, and every workflow --
+    // not only root scripts whose name happens to contain "db".
+    expect(scanned).toContain('package.json');
+    expect(scanned).toContain('.github/workflows/spec000.yml');
+    for (const workspace of typescriptWorkspaces)
+      expect(scanned).toContain(`${workspace}/package.json`);
+    // The legitimate migrate/validate commands required by the frozen SPEC must survive.
+    const scripts = (
+      JSON.parse(readFileSync('package.json', 'utf8')) as {
+        scripts: Record<string, string>;
+      }
+    ).scripts;
+    expect(scripts['db:migrate:deploy']).toContain('prisma migrate deploy');
+    expect(scripts['db:validate']).toContain('prisma validate');
   });
   it('spec000_scripts_are_cross_platform', () => {
     const manifest = JSON.parse(readFileSync('package.json', 'utf8')) as {
@@ -73,22 +85,9 @@ describe('SPEC-000 critical invariants', () => {
         (value) => !/(^|&&)\s*[A-Z_]+=/.test(value) && !value.includes('/bin/bash'),
       ),
     ).toBe(true);
+    expect(execPackageManagerSync(['--version'], { encoding: 'utf8' }).trim()).toBe('11.21.0');
   });
   it('spec000_no_workspace_weakens_required_ts_flags', () => {
-    const base = JSON.parse(readFileSync('tsconfig.base.json', 'utf8')) as {
-      compilerOptions: Record<string, boolean>;
-    };
-    for (const flag of [
-      'strict',
-      'noUncheckedIndexedAccess',
-      'exactOptionalPropertyTypes',
-      'noImplicitOverride',
-      'noFallthroughCasesInSwitch',
-      'forceConsistentCasingInFileNames',
-      'isolatedModules',
-      'noUncheckedSideEffectImports',
-    ])
-      expect(base.compilerOptions[flag]).toBe(true);
-    expect(isDeepStrictEqual(base.compilerOptions.strict, true)).toBe(true);
+    expect(verifyWorkspaceTypeScriptFlags(process.cwd())).toEqual([...typescriptWorkspaces].sort());
   });
 });
