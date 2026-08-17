@@ -1,0 +1,31 @@
+{
+  "extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"],
+  "generatedExclusions": ["packages/db/generated"],
+  "buildOutputExclusions": [
+    "apps/api/dist",
+    "apps/mobile/.expo",
+    "apps/mobile/.spec000-export",
+    "apps/admin/.next",
+    "packages/domain/dist",
+    "packages/contracts/dist",
+    "packages/config/dist",
+    "packages/db/dist",
+    "packages/observability/dist"
+  ],
+  "production": [
+    "apps/admin/app/layout.tsx",
+    "apps/admin/app/page.tsx",
+    "apps/admin/next-env.d.ts",
+    "apps/api/src/app.controller.ts",
+    "apps/api/src/app.module.ts",
+    "apps/api/src/bootstrap.ts",
+    "apps/api/src/main.ts",
+    "apps/mobile/App.tsx",
+    "packages/config/src/index.ts",
+    "packages/contracts/src/index.ts",
+    "packages/db/src/index.ts",
+    "packages/domain/src/index.ts",
+    "packages/observability/src/index.ts"
+  ],
+  "developmentOnly": ["packages/testkit/src/index.ts"]
+}

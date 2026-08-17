@@ -1,0 +1,204 @@
+{
+  "version": 1,
+  "invariants": {
+    "INV-000-001": ["spec000_no_product_logic_surface"],
+    "INV-000-002": [
+      "spec000_all_workspaces_strict_typecheck",
+      "spec000_no_workspace_weakens_required_ts_flags"
+    ],
+    "INV-000-003": ["spec000_dependency_boundaries_enforced"],
+    "INV-000-004": ["spec000_no_app_to_app_imports"],
+    "INV-000-005": ["spec000_domain_is_pure_typescript"],
+    "INV-000-006": ["spec000_runtime_mode_fail_closed"],
+    "INV-000-007": [
+      "spec000_process_env_access_is_config_only",
+      "spec000_runtime_config_is_startup_immutable",
+      "spec000_runtime_mode_request_inputs_have_no_authority"
+    ],
+    "INV-000-008": [
+      "spec000_production_testkit_absence",
+      "spec000_production_build_testkit_absence"
+    ],
+    "INV-000-009": ["spec000_no_private_secret_public_env_surface"],
+    "INV-000-010": ["spec000_secret_scan_is_required_gate"],
+    "INV-000-011": ["spec000_frozen_lockfile_install"],
+    "INV-000-012": ["spec000_real_migration_probe_applies"],
+    "INV-000-013": ["spec000_no_db_push_in_production_or_ci"],
+    "INV-000-014": ["spec000_api_has_no_product_routes"],
+    "INV-000-015": ["spec000_readiness_reflects_real_database_dependency"],
+    "INV-000-016": ["spec000_logging_redaction_positive_probe"],
+    "INV-000-017": ["spec000_scripts_are_cross_platform"],
+    "INV-000-018A": ["spec000_required_ci_definition_fail_closed"],
+    "INV-000-018B": ["spec000_github_branch_protection_verified"],
+    "INV-000-019": ["spec000_mobile_has_no_server_db_dependency"],
+    "INV-000-020": ["spec000_no_auth_payment_provider_or_mock_surface"],
+    "INV-000-021": [
+      "spec000_mobile_typecheck",
+      "spec000_mobile_doctor",
+      "spec000_mobile_export_ci"
+    ],
+    "INV-000-022": ["spec000_evidence_registry_matches_executed_results"],
+    "INV-000-023": ["spec000_evidence_registry_self_test"],
+    "INV-000-024": ["spec000_toolchain_versions_are_enforced"],
+    "INV-000-025": ["spec000_env_files_are_gitignored"],
+    "INV-000-026": ["spec000_production_rejects_dev_configuration"]
+  },
+  "executionOrder": [
+    "pnpm install --frozen-lockfile",
+    "pnpm lint",
+    "pnpm typecheck",
+    "pnpm boundaries:check",
+    "pnpm test",
+    "pnpm build",
+    "pnpm db:validate",
+    "pnpm secrets:check",
+    "pnpm mobile:typecheck",
+    "pnpm mobile:doctor",
+    "pnpm mobile:export:ci",
+    "pnpm spec000:zero-product-logic:verify",
+    "pnpm spec000:ci-definition:verify",
+    "pnpm toolchain:verify",
+    "pnpm spec000:migration:verify",
+    "pnpm spec000:readiness:verify",
+    "pnpm spec000:build-artifacts:verify",
+    "pnpm spec000:github-protection:verify"
+  ],
+  "evidence": {
+    "spec000_formatting_and_lint_policy": {
+      "kind": "static_validator",
+      "command": "pnpm lint"
+    },
+    "spec000_production_builds_succeed": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm build"
+    },
+    "spec000_generated_artifacts_are_ignored_and_clean": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm build"
+    },
+    "spec000_prisma_schema_validates_and_generates": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm db:validate"
+    },
+    "spec000_no_product_logic_surface": {
+      "kind": "static_validator",
+      "command": "pnpm spec000:zero-product-logic:verify"
+    },
+    "spec000_all_workspaces_strict_typecheck": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm typecheck"
+    },
+    "spec000_no_workspace_weakens_required_ts_flags": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec000_dependency_boundaries_enforced": {
+      "kind": "static_validator",
+      "command": "pnpm boundaries:check"
+    },
+    "spec000_no_app_to_app_imports": {
+      "kind": "static_validator",
+      "command": "pnpm boundaries:check"
+    },
+    "spec000_domain_is_pure_typescript": {
+      "kind": "static_validator",
+      "command": "pnpm boundaries:check"
+    },
+    "spec000_runtime_mode_fail_closed": { "kind": "automated_test", "command": "pnpm test" },
+    "spec000_process_env_access_is_config_only": {
+      "kind": "static_validator",
+      "command": "pnpm boundaries:check"
+    },
+    "spec000_runtime_config_is_startup_immutable": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec000_runtime_mode_request_inputs_have_no_authority": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec000_production_testkit_absence": {
+      "kind": "static_validator",
+      "command": "pnpm boundaries:check"
+    },
+    "spec000_production_build_testkit_absence": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm spec000:build-artifacts:verify"
+    },
+    "spec000_no_private_secret_public_env_surface": {
+      "kind": "static_validator",
+      "command": "pnpm secrets:check"
+    },
+    "spec000_secret_scan_is_required_gate": {
+      "kind": "static_validator",
+      "command": "pnpm secrets:check"
+    },
+    "spec000_frozen_lockfile_install": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm install --frozen-lockfile"
+    },
+    "spec000_real_migration_probe_applies": {
+      "kind": "runtime_integration_check",
+      "command": "pnpm spec000:migration:verify"
+    },
+    "spec000_no_db_push_in_production_or_ci": { "kind": "automated_test", "command": "pnpm test" },
+    "spec000_api_has_no_product_routes": {
+      "kind": "static_validator",
+      "command": "pnpm spec000:zero-product-logic:verify"
+    },
+    "spec000_readiness_reflects_real_database_dependency": {
+      "kind": "runtime_integration_check",
+      "command": "pnpm spec000:readiness:verify"
+    },
+    "spec000_logging_redaction_positive_probe": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec000_scripts_are_cross_platform": { "kind": "automated_test", "command": "pnpm test" },
+    "spec000_required_ci_definition_fail_closed": {
+      "kind": "static_validator",
+      "command": "pnpm spec000:ci-definition:verify"
+    },
+    "spec000_github_branch_protection_verified": {
+      "kind": "external_platform_check",
+      "command": "pnpm spec000:github-protection:verify"
+    },
+    "spec000_mobile_has_no_server_db_dependency": {
+      "kind": "static_validator",
+      "command": "pnpm boundaries:check"
+    },
+    "spec000_no_auth_payment_provider_or_mock_surface": {
+      "kind": "static_validator",
+      "command": "pnpm spec000:zero-product-logic:verify"
+    },
+    "spec000_mobile_typecheck": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm mobile:typecheck"
+    },
+    "spec000_mobile_doctor": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm mobile:doctor"
+    },
+    "spec000_mobile_export_ci": {
+      "kind": "build_or_migration_check",
+      "command": "pnpm mobile:export:ci"
+    },
+    "spec000_evidence_registry_matches_executed_results": {
+      "kind": "static_validator",
+      "command": "pnpm spec000:evidence:verify"
+    },
+    "spec000_evidence_registry_self_test": {
+      "kind": "static_validator",
+      "command": "pnpm spec000:evidence:verify"
+    },
+    "spec000_toolchain_versions_are_enforced": {
+      "kind": "static_validator",
+      "command": "pnpm toolchain:verify"
+    },
+    "spec000_env_files_are_gitignored": { "kind": "automated_test", "command": "pnpm test" },
+    "spec000_production_rejects_dev_configuration": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    }
+  }
+}

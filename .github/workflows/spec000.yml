@@ -1,0 +1,37 @@
+name: SPEC-000 Verification
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [codex/spec-000-repository-bootstrap]
+
+permissions:
+  contents: read
+
+jobs:
+  spec000:
+    name: SPEC-000 Required Gate
+    runs-on: ubuntu-latest
+    env:
+      DHAMANI_RUNTIME_MODE: test
+      DATABASE_URL: postgresql://dhamani_dev:dhamani_dev_only@localhost:5432/dhamani_dev
+      DHAMANI_PRIVATE_SENTINEL: ci-private-sentinel
+      PORT: 3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.21.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: docker compose down --volumes --remove-orphans
+      - run: docker compose up --detach --wait postgres
+      - run: pnpm ci:verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spec000-evidence
+          path: evidence/results/
