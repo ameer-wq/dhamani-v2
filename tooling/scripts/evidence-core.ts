@@ -11,6 +11,10 @@ export type EvidenceManifest = {
   invariants: Record<string, string[]>;
   evidence: Record<string, Evidence>;
   executionOrder: string[];
+  spec001RequiredEvidence?: {
+    r2CleanIncorporation: string[];
+    earthquakeScenarios: string[];
+  };
 };
 export type CommandResult = { exitCode: number; output: string };
 export type VitestReport = {
@@ -248,6 +252,381 @@ const requiredCriticalEvidence: Record<
   ],
 };
 
+/**
+ * SPEC-001 introduces the first product kernel, so its invariants join the frozen registry rather
+ * than replacing it. Every SPEC-000 row below is preserved unchanged; the SPEC-001 rows are
+ * additive and equally fail-closed, so a manifest cannot silently drop a required item.
+ */
+const requiredSpec001Evidence: Record<
+  string,
+  Array<{ id: string; kind: EvidenceKind; command: string }>
+> = {
+  'INV-001-001': [
+    {
+      id: 'spec001_v1_deal_type_registry_is_exact_and_no_deposit',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-002': [
+    {
+      id: 'spec001_role_pair_is_server_derived_per_deal',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-003': [
+    {
+      id: 'spec001_same_principal_cannot_bind_both_slots',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-004': [
+    {
+      id: 'spec001_committed_deal_has_exactly_two_party_slots',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-005': [
+    { id: 'spec001_deal_birth_is_all_or_nothing', kind: 'automated_test', command: 'pnpm test' },
+  ],
+  'INV-001-006': [
+    {
+      id: 'spec001_formal_identity_fields_cannot_be_mutated',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-007': [
+    {
+      id: 'spec001_pending_invite_is_opaque_and_one_time_bind',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-008': [
+    {
+      id: 'spec001_invitation_expiry_is_server_authoritative_168h',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-009': [
+    {
+      id: 'spec001_first_mutual_acceptance_consumes_invitation_expiry',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-010': [
+    {
+      id: 'spec001_revision_rejects_update_delete_truncate_direct_sql',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-011': [
+    {
+      id: 'spec001_revision_chain_is_linear_and_same_deal',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-012': [
+    {
+      id: 'spec001_concurrent_successor_race_has_one_winner',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-013': [
+    {
+      id: 'spec001_revision_creator_auto_accepts_exact_revision',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-014': [
+    {
+      id: 'spec001_acceptance_is_exact_revision_only',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-015': [
+    {
+      id: 'spec001_successor_makes_prior_acceptance_stale_not_deleted',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-016': [
+    {
+      id: 'spec001_agreement_ready_is_strictly_derived',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-017': [
+    {
+      id: 'spec001_client_terms_cannot_author_domain_authority',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-018': [
+    {
+      id: 'spec001_reject_terminates_deal_negotiation',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-019': [
+    {
+      id: 'spec001_invitation_withdraw_preconditions_are_strict',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-020': [
+    {
+      id: 'spec001_successor_creator_can_terminally_withdraw_waiting_negotiation',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-021': [
+    {
+      id: 'spec001_modification_credits_are_history_derived_and_bounded',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-022': [
+    { id: 'spec001_negotiation_is_turn_based', kind: 'automated_test', command: 'pnpm test' },
+  ],
+  'INV-001-023': [
+    {
+      id: 'spec001_public_reference_unique_stable_and_collision_safe',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-024': [
+    {
+      id: 'spec001_terms_fingerprint_is_jcs_sha256_deterministic',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-025': [
+    {
+      id: 'spec001_contract_text_is_preserved_exactly',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-026': [
+    {
+      id: 'spec001_terms_envelope_is_bounded_and_schema_bound',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-027': [
+    {
+      id: 'spec001_all_write_commands_are_idempotent',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-028': [
+    {
+      id: 'spec001_idempotency_key_payload_change_conflicts',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-029': [
+    {
+      id: 'spec001_writes_are_deal_scoped_not_global_lock',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-030': [
+    {
+      id: 'spec001_stale_action_loses_with_typed_conflict',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-031': [
+    {
+      id: 'spec001_runtime_role_cannot_bypass_db_protections',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-032': [
+    {
+      id: 'spec001_domain_write_and_audit_commit_atomically',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-033': [
+    {
+      id: 'spec001_restart_persistence_preserves_agreement_truth',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-034': [
+    {
+      id: 'spec001_payer_role_is_deterministic_and_money_absent',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-035': [
+    {
+      id: 'spec001_has_no_untrusted_principal_http_authority',
+      kind: 'static_validator',
+      command: 'pnpm spec000:zero-product-logic:verify',
+    },
+  ],
+  'INV-001-036': [
+    {
+      id: 'spec001_zero_financial_execution_surface',
+      kind: 'static_validator',
+      command: 'pnpm spec000:zero-product-logic:verify',
+    },
+  ],
+  'INV-001-037': [
+    {
+      id: 'spec001_current_revision_fk_is_nonnull_same_deal_and_deferred',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-038': [
+    {
+      id: 'spec001_command_time_is_single_db_value_after_lock',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-039': [
+    {
+      id: 'spec001_revision_integrity_failure_fails_closed',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-040': [
+    {
+      id: 'spec001_entity_ids_are_server_uuidv7_only',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-041': [
+    {
+      id: 'spec001_audit_and_logs_contain_no_terms_or_pii',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-042': [
+    {
+      id: 'spec001_reads_require_authorized_actor_scope',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-043': [
+    {
+      id: 'spec001_e39_four_way_conflicting_action_race',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-044': [
+    {
+      id: 'spec001_e40_expiry_materializer_after_timer_consumed',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+  'INV-001-045': [
+    { id: 'spec001_e41_pending_bind_terminal_race', kind: 'automated_test', command: 'pnpm test' },
+  ],
+  'INV-001-046': [
+    {
+      id: 'spec001_e42_idempotent_replay_after_later_state_change',
+      kind: 'automated_test',
+      command: 'pnpm test',
+    },
+  ],
+};
+
+/** The 42 manifest-bound earthquake scenario identities (Frozen SPEC §32). */
+export const requiredSpec001EarthquakeIds = [
+  'spec001_e01_formal_birth',
+  'spec001_e02_create_retries_sequential_and_concurrent',
+  'spec001_e03_create_key_payload_mutation',
+  'spec001_e04_same_principal_both_sides',
+  'spec001_e05_pending_counterparty_birth',
+  'spec001_e06_one_time_binding',
+  'spec001_e07_bind_after_expiry',
+  'spec001_e08_direct_r1_accept',
+  'spec001_e09_r1_reject_terminal',
+  'spec001_e10_r1_withdraw_accept_race',
+  'spec001_e11_view_does_not_block_withdrawal',
+  'spec001_e12_successor_proposal',
+  'spec001_e13_successor_accept_no_deadlock',
+  'spec001_e14_stale_accept_race',
+  'spec001_e15_concurrent_successor_no_fork',
+  'spec001_e16_turn_based_spam_blocked',
+  'spec001_e17_unchanged_proposal_no_credit',
+  'spec001_e18_modification_limits',
+  'spec001_e19_response_loss_replay',
+  'spec001_e20_duplicate_accept_retry',
+  'spec001_e21_awaited_accept_concurrent_double_submit',
+  'spec001_e22_exact_expiry_boundary_single_db_time',
+  'spec001_e23_mutual_accept_before_expiry_consumes_timer',
+  'spec001_e24_reshare_cannot_move_invite_time',
+  'spec001_e25_r2_proposer_withdrawal',
+  'spec001_e26_cross_deal_revision_abuse',
+  'spec001_e27_roles_are_per_deal',
+  'spec001_e28_append_only_runtime_role_bypass_attacks',
+  'spec001_e29_participant_db_attacks',
+  'spec001_e30_current_revision_cross_deal_corruption',
+  'spec001_e31_birth_failure_injection_matrix',
+  'spec001_e32_successor_failure_rollback',
+  'spec001_e33_real_restart_preserves_truth',
+  'spec001_e34_jcs_key_order_and_whitespace',
+  'spec001_e35_contract_string_distinction',
+  'spec001_e36_terms_payload_bounds',
+  'spec001_e37_unsupported_schema_fail_closed',
+  'spec001_e38_terms_authority_smuggling_is_inert',
+  'spec001_e39_four_way_conflicting_action_race',
+  'spec001_e40_expiry_materializer_after_timer_consumed',
+  'spec001_e41_pending_bind_terminal_race',
+  'spec001_e42_idempotent_replay_after_later_state_change',
+] as const;
+
+/** Additional required gate evidence from R2 clean incorporation (Frozen SPEC §31). */
+export const requiredSpec001R2Ids = [
+  'spec001_runtime_connection_role_is_nonowner_least_privilege',
+  'spec001_expiry_latch_replays_invitation_expired_consistently',
+  'spec001_raw_terms_cap_rejects_before_decode',
+  'spec001_terminal_error_payload_exposes_termination_reason',
+] as const;
+
 export const frozenRequiredCommands = [
   'pnpm install --frozen-lockfile',
   'pnpm lint',
@@ -282,13 +661,31 @@ export function validateEvidenceManifest(
   requiredCommands: readonly string[] = frozenRequiredCommands,
 ): string[] {
   const errors: string[] = [];
+  const allRequired = { ...requiredCriticalEvidence, ...requiredSpec001Evidence };
   const actualInvariantIds = Object.keys(manifest.invariants).sort();
-  const requiredInvariantIds = Object.keys(requiredCriticalEvidence).sort();
+  const requiredInvariantIds = Object.keys(allRequired).sort();
   if (JSON.stringify(actualInvariantIds) !== JSON.stringify(requiredInvariantIds))
     errors.push(
       `critical invariant registry differs actual=${JSON.stringify(actualInvariantIds)} expected=${JSON.stringify(requiredInvariantIds)}`,
     );
-  for (const [invariant, descriptors] of Object.entries(requiredCriticalEvidence)) {
+
+  // Every earthquake scenario and R2 clean-incorporation item must be declared and owned by a
+  // real executable command, so none of them can quietly disappear from the aggregate.
+  const declared = manifest.spec001RequiredEvidence;
+  if (!declared) errors.push('manifest declares no spec001RequiredEvidence block');
+  else {
+    for (const [label, expected, actual] of [
+      ['earthquake', requiredSpec001EarthquakeIds, declared.earthquakeScenarios],
+      ['r2', requiredSpec001R2Ids, declared.r2CleanIncorporation],
+    ] as const) {
+      if (JSON.stringify([...expected]) !== JSON.stringify([...actual]))
+        errors.push(`${label} evidence identities differ from the frozen SPEC-001 list`);
+      for (const id of expected)
+        if (!manifest.evidence[id]) errors.push(`${label} evidence missing from manifest: ${id}`);
+    }
+  }
+
+  for (const [invariant, descriptors] of Object.entries(allRequired)) {
     const mapped = manifest.invariants[invariant] ?? [];
     const expectedIds = descriptors.map((descriptor) => descriptor.id).sort();
     if (JSON.stringify([...mapped].sort()) !== JSON.stringify(expectedIds))

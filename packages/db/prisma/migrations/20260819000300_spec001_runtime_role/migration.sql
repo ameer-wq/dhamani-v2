@@ -54,7 +54,7 @@ GRANT UPDATE ("principalId", "boundAt") ON "DealPartySlot" TO dhamani_runtime;
 
 -- Idempotency: claim, read, and complete the stored outcome. Nothing else.
 GRANT SELECT, INSERT ON "ApplicationIdempotencyRecord" TO dhamani_runtime;
-GRANT UPDATE ("outcomeKind", "outcome") ON "ApplicationIdempotencyRecord" TO dhamani_runtime;
+GRANT UPDATE ("outcomeKind", "outcome", "commandTime") ON "ApplicationIdempotencyRecord" TO dhamani_runtime;
 
 -- Future tables in this schema must not silently become runtime-writable.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM dhamani_runtime;

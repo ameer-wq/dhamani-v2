@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { Spec001Error } from '@dhamani/domain';
+import { Spec001Error, type Spec001ErrorCode } from '@dhamani/domain';
 
 /**
  * PostgreSQL access for the SPEC-001 kernel.
@@ -68,12 +68,38 @@ export function isRetryableDatabaseError(error: unknown): boolean {
   return postgres !== undefined && RETRYABLE_SQLSTATES.has(postgres.code ?? '');
 }
 
-/** Never let a raw Prisma/PostgreSQL error become the caller contract (§27). */
+/**
+ * Constraint-specific meanings for a unique violation.
+ *
+ * Collapsing every 23505 into one code would misreport a duplicate revision number, a duplicate
+ * bound Principal and a duplicate idempotency claim as the same thing. Each entry below is a
+ * frozen §27 code, so this stays inside the stable contract rather than inventing one.
+ */
+const UNIQUE_VIOLATION_CODES: ReadonlyMap<string, Spec001ErrorCode> = new Map([
+  ['RevisionResponse_revision_principal_key', 'REVISION_ALREADY_RESPONDED'],
+  ['AgreementRevision_deal_number_key', 'REVISION_SEQUENCE_CONFLICT'],
+  ['DealPartySlot_deal_principal_key', 'SAME_PARTICIPANT_BOTH_SIDES'],
+  ['DealPartySlot_deal_slotKind_key', 'REVISION_RESPONSE_CONFLICT'],
+  ['ApplicationIdempotencyRecord_claim_key', 'IDEMPOTENT_REQUEST_IN_PROGRESS'],
+]);
+
+/**
+ * Never let a raw Prisma/PostgreSQL error become the caller contract (§27).
+ *
+ * A SQLSTATE with no stable meaning is deliberately re-thrown rather than dressed up as a
+ * contract outcome: inventing a success-shaped or retryable answer for an unknown persistence
+ * fault would hide a real defect behind a stable-looking code.
+ */
 export function mapDatabaseError(error: unknown): Spec001Error {
   if (error instanceof Spec001Error) return error;
   if (isRetryableDatabaseError(error)) return new Spec001Error('DEAL_WRITE_RETRYABLE');
   const postgres = postgresErrorOf(error);
-  if (postgres?.code === '23505') return new Spec001Error('REVISION_RESPONSE_CONFLICT');
+  if (postgres?.code === '23505') {
+    const mapped = UNIQUE_VIOLATION_CODES.get(postgres.constraint ?? '');
+    return new Spec001Error(mapped ?? 'REVISION_RESPONSE_CONFLICT', {
+      ...(postgres.constraint ? { field: postgres.constraint } : {}),
+    });
+  }
   throw error;
 }
 
@@ -100,43 +126,6 @@ export async function withTransaction<T>(
   } finally {
     client.release();
   }
-}
-
-export type LockedDeal = Readonly<{
-  id: string;
-  publicReference: string;
-  dealType: string;
-  currentRevisionId: string;
-  sentAt: Date;
-  inviteExpiresAt: Date;
-  firstMutualAcceptedAt: Date | null;
-  terminationReason: string | null;
-  terminatedAt: Date | null;
-  version: number;
-  createdAt: Date;
-}>;
-
-/**
- * §23.1 steps 2–3: acquire the mandatory Deal row lock, then capture exactly one PostgreSQL
- * `clock_timestamp()`.
- *
- * The clock is read *after* the lock on purpose (§29): `now()`/`transaction_timestamp()` are
- * fixed at transaction start and would predate any lock wait, so a command that waited would
- * evaluate deadlines against a stale instant.
- */
-export async function lockDealAndCaptureCommandTime(
-  sql: Sql,
-  dealId: string,
-): Promise<{ deal: LockedDeal | undefined; commandTime: Date }> {
-  const locked = await sql.query<LockedDeal>(
-    `SELECT "id","publicReference","dealType"::text AS "dealType","currentRevisionId","sentAt",
-            "inviteExpiresAt","firstMutualAcceptedAt","terminationReason"::text AS "terminationReason",
-            "terminatedAt","version","createdAt"
-       FROM "Deal" WHERE "id" = $1 FOR UPDATE`,
-    [dealId],
-  );
-  const commandTime = await captureCommandTime(sql);
-  return { deal: locked.rows[0], commandTime };
 }
 
 /** Exactly one authoritative wall-clock read per command (§29). */

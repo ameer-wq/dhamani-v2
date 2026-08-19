@@ -13,3 +13,5 @@ export * from './spec001/json/jcs.js';
 export * from './spec001/idempotency.js';
 export * from './spec001/terms.js';
 export * from './spec001/integrity.js';
+export * from './spec001/state.js';
+export * from './spec001/readiness.js';

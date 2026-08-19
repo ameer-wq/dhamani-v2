@@ -201,9 +201,13 @@ BEGIN
      OR NEW."scope" <> OLD."scope"
      OR NEW."commandType" <> OLD."commandType"
      OR NEW."idempotencyKey" <> OLD."idempotencyKey"
-     OR NEW."requestFingerprint" <> OLD."requestFingerprint"
-     OR NEW."commandTime" <> OLD."commandTime" THEN
+     OR NEW."requestFingerprint" <> OLD."requestFingerprint" THEN
     RAISE EXCEPTION 'SPEC001_IDEMPOTENCY_CLAIM_IMMUTABLE: claim identity cannot change'
+      USING ERRCODE = 'raise_exception';
+  END IF;
+  -- commandTime may move NULL -> one value exactly once, and is never rewritten afterwards.
+  IF OLD."commandTime" IS NOT NULL AND NEW."commandTime" IS DISTINCT FROM OLD."commandTime" THEN
+    RAISE EXCEPTION 'SPEC001_IDEMPOTENCY_COMMAND_TIME_SET_ONCE: commandTime cannot be rewritten'
       USING ERRCODE = 'raise_exception';
   END IF;
   RETURN NEW;
@@ -278,16 +282,17 @@ CREATE OR REPLACE FUNCTION spec001_idempotency_outcome_settled() RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
 DECLARE
   settled_kind TEXT;
+  settled_time TIMESTAMPTZ;
 BEGIN
   -- A deferred constraint trigger fires at COMMIT with the NEW snapshot captured when the event
   -- was queued, so NEW still reads 'PENDING' even after the claim was settled later in the same
   -- transaction. The current row must therefore be re-read rather than trusting NEW.
-  SELECT "outcomeKind" INTO settled_kind
+  SELECT "outcomeKind", "commandTime" INTO settled_kind, settled_time
     FROM "ApplicationIdempotencyRecord" WHERE "id" = NEW."id";
   IF settled_kind IS NULL THEN
     RETURN NULL;
   END IF;
-  IF settled_kind = 'PENDING' THEN
+  IF settled_kind = 'PENDING' OR settled_time IS NULL THEN
     RAISE EXCEPTION 'SPEC001_IDEMPOTENCY_OUTCOME_UNSETTLED: claim committed without an outcome'
       USING ERRCODE = 'raise_exception';
   END IF;

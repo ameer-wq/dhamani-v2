@@ -226,7 +226,11 @@ CREATE TABLE "ApplicationIdempotencyRecord" (
   "requestFingerprint" BYTEA NOT NULL,
   "outcomeKind" TEXT NOT NULL,
   "outcome" JSONB NOT NULL,
-  "commandTime" TIMESTAMPTZ(6) NOT NULL,
+  -- The authoritative command timestamp is part of the committed outcome, not of the claim:
+  -- §23.1 orders the claim before the Deal row lock, while §29 takes the single
+  -- clock_timestamp() after that lock. It is NULL only while the claim is unsettled, and the
+  -- deferred settle trigger rejects a committed row that still lacks it.
+  "commandTime" TIMESTAMPTZ(6),
   CONSTRAINT "ApplicationIdempotencyRecord_pkey" PRIMARY KEY ("id"),
   CONSTRAINT "ApplicationIdempotencyRecord_fingerprint_length_check" CHECK (
     octet_length("requestFingerprint") = 32

@@ -38,10 +38,20 @@ try {
     "SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY schemaname, tablename",
   );
   const names = objects.rows.map((row) => `${String(row.schemaname)}.${String(row.tablename)}`);
-  if (
-    JSON.stringify(names) !==
-    JSON.stringify(['dhamani_bootstrap._migration_probe', 'public._prisma_migrations'])
-  )
+  // The applied object set stays an exact allowlist: the SPEC-000 bootstrap probe plus exactly
+  // the six tables the Frozen SPEC-001 contract mandates (§24). A seventh table — for example a
+  // wallet or ledger table — still fails this gate closed.
+  const expectedObjects = [
+    'dhamani_bootstrap._migration_probe',
+    'public.AgreementRevision',
+    'public.ApplicationIdempotencyRecord',
+    'public.Deal',
+    'public.DealAgreementAuditEvent',
+    'public.DealPartySlot',
+    'public.RevisionResponse',
+    'public._prisma_migrations',
+  ];
+  if (JSON.stringify(names) !== JSON.stringify(expectedObjects))
     fail(`unexpected database objects: ${JSON.stringify(names)}`);
 } finally {
   await after.end();

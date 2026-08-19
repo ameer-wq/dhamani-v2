@@ -184,7 +184,7 @@ model ApplicationIdempotencyRecord {
   requestFingerprint Bytes
   outcomeKind        String
   outcome            Json
-  commandTime        DateTime @db.Timestamptz(6)
+  commandTime        DateTime? @db.Timestamptz(6)
 
   @@unique([scope, commandType, idempotencyKey])
 }

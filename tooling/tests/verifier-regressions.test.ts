@@ -139,6 +139,174 @@ describe('zero-product verifier adversarial regressions', () => {
   });
 });
 
+/**
+ * SPEC-001 made the bootstrap "zero product surface" gate successor-aware. These regressions
+ * prove the narrowed gate is still fail-closed: the SPEC-000 prohibition survives verbatim for
+ * every non-kernel file, and the kernel allowance cannot be widened or abused.
+ */
+describe('successor-aware zero-product verifier remains fail-closed', () => {
+  function mutateInventory(fixture: string, mutate: (inventory: Record<string, unknown>) => void) {
+    const path = join(fixture, 'tooling/boundaries/production-source-inventory.json');
+    const inventory = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    mutate(inventory);
+    writeFileSync(path, JSON.stringify(inventory));
+  }
+
+  it('still rejects kernel vocabulary in a non-SPEC-001 bootstrap file', () => {
+    const fixture = createProductionFixture();
+    try {
+      // packages/contracts is not declared SPEC-001 source, so the original SPEC-000 prohibition
+      // must still apply to it in full.
+      writeRelative(
+        fixture,
+        'packages/contracts/src/index.ts',
+        'export type DealAgreementRevision = { id: string };\n',
+      );
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('product surface');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it('rejects out-of-scope financial execution surface inside a SPEC-001 kernel file', () => {
+    const fixture = createProductionFixture();
+    try {
+      writeRelative(
+        fixture,
+        'packages/domain/src/spec001/state.ts',
+        'export const payoutLedgerEntry = { refund: true };\n',
+      );
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('out-of-scope execution surface');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it('does not let a comment launder an out-of-scope identifier back in', () => {
+    const fixture = createProductionFixture();
+    try {
+      // Prose about a later spec is documentation and must stay allowed...
+      writeRelative(
+        fixture,
+        'packages/domain/src/spec001/state.ts',
+        '// A later funding spec owns payout and refund behavior.\nexport const marker = true;\n',
+      );
+      expect(runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']).status).toBe(
+        0,
+      );
+      // ...but the same words as real code surface must not be.
+      writeRelative(
+        fixture,
+        'packages/domain/src/spec001/state.ts',
+        'export const refundAmount = 1;\n',
+      );
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('out-of-scope execution surface');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it('rejects a seventh Prisma model beyond the six frozen tables', () => {
+    const fixture = createProductionFixture();
+    try {
+      const path = join(fixture, 'packages/db/prisma/schema.prisma');
+      writeFileSync(
+        path,
+        `${readFileSync(path, 'utf8')}\nmodel WalletBalance {\n  id String @id @db.Uuid\n}\n`,
+      );
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('prisma model set differs');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it('rejects a financial execution column on a frozen table', () => {
+    const fixture = createProductionFixture();
+    try {
+      const path = join(fixture, 'packages/db/prisma/schema.prisma');
+      writeFileSync(
+        path,
+        readFileSync(path, 'utf8').replace(
+          '  version               Int',
+          '  version               Int\n  fundingDeadline       DateTime?',
+        ),
+      );
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('financial execution column');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it('rejects a participant-facing HTTP route declared outside the health controller', () => {
+    const fixture = createProductionFixture();
+    try {
+      writeRelative(
+        fixture,
+        'apps/api/src/spec001/kernel.ts',
+        "import { Controller, Get } from '@nestjs/common';\n" +
+          "@Controller('deals')\nexport class Leak {\n  @Get(':id')\n  read(): null { return null; }\n}\n",
+      );
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('participant-facing HTTP route surface');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it('rejects widening the SPEC-001 kernel path allowlist from the inventory file', () => {
+    const fixture = createProductionFixture();
+    try {
+      mutateInventory(fixture, (inventory) => {
+        (inventory.spec001Prefixes as string[]).push('packages/contracts/src/');
+      });
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('spec001 source prefixes differ');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it('rejects widening the SPEC-001 barrel allowlist from the inventory file', () => {
+    const fixture = createProductionFixture();
+    try {
+      mutateInventory(fixture, (inventory) => {
+        (inventory.spec001Barrels as string[]).push('packages/contracts/src/index.ts');
+      });
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('spec001 barrel allowlist differs');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+
+  it('rejects adding a ninth command to the declared registry', () => {
+    const fixture = createProductionFixture();
+    try {
+      mutateInventory(fixture, (inventory) => {
+        (inventory.spec001Commands as string[]).push('ReleaseFundsToSeller');
+      });
+      const result = runToolingScript('zero-product-verify.ts', fixture, ['--fixture-child']);
+      expect(result.status).toBe(1);
+      expect(combinedOutput(result)).toContain('spec001 command registry differs');
+    } finally {
+      removeFixture(fixture);
+    }
+  });
+});
+
 describe('dependency-boundary verifier adversarial regressions', () => {
   it('accepts the clean production graph', () => {
     const fixture = createProductionFixture();

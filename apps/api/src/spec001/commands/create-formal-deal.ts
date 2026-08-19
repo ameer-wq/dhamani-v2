@@ -1,6 +1,8 @@
 import type pg from 'pg';
 import {
+  MAX_CANONICAL_BYTES,
   Spec001Error,
+  assertRawTermsWithinCap,
   canonicalizeJsonNode,
   computeIdempotencyFingerprint,
   computeRevisionIntegrity,
@@ -11,9 +13,8 @@ import {
   requireDealType,
   resolveTermsSchema,
   validateTermsEnvelope,
-  assertRawTermsWithinCap,
-  MAX_CANONICAL_BYTES,
   type CounterpartyTarget,
+  type JsonNode,
   type KernelPorts,
 } from '@dhamani/domain';
 import {
@@ -24,6 +25,7 @@ import {
   type Sql,
 } from '../database.js';
 import { claimIdempotency, settleIdempotency } from '../idempotency-store.js';
+import { appendAuditEvent, insertResponse } from '../repository.js';
 
 const INVITE_WINDOW_HOURS = 168;
 const MAX_REFERENCE_COLLISION_RETRIES = 10;
@@ -80,8 +82,7 @@ export async function createFormalDeal(
     throw new Spec001Error('TERMS_JSON_UNSUPPORTED_UNICODE', { reason: 'INVALID_UTF8' });
   }
   const termsNode = parseStrictJsonText(decoded);
-  const termsCanonicalText = canonicalizeJsonNode(termsNode);
-  const termsCanonicalBytes = new TextEncoder().encode(termsCanonicalText);
+  const termsCanonicalBytes = new TextEncoder().encode(canonicalizeJsonNode(termsNode));
   if (termsCanonicalBytes.byteLength > MAX_CANONICAL_BYTES)
     throw new Spec001Error('TERMS_PAYLOAD_TOO_LARGE');
 
@@ -100,10 +101,9 @@ export async function createFormalDeal(
     ports.sha256,
   );
 
-  // §5.3 — a public-reference collision aborts the whole birth transaction and it is retried
+  // §5.3 — a public-reference collision aborts the whole birth transaction, which is then retried
   // under the same semantic idempotency key with a newly generated reference and freshly
   // generated Deal/R1 ids. Only the identified reference unique violation is retryable here.
-  let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_REFERENCE_COLLISION_RETRIES; attempt += 1) {
     try {
       return await withTransaction(pool, (sql) =>
@@ -117,10 +117,8 @@ export async function createFormalDeal(
     } catch (error) {
       if (!isUniqueViolation(error, PUBLIC_REFERENCE_UNIQUE_CONSTRAINT))
         throw mapDatabaseError(error);
-      lastError = error;
     }
   }
-  void lastError;
   // Exhaustion commits no Formal Deal and no idempotency success.
   throw new Spec001Error('DEAL_REFERENCE_GENERATION_FAILED');
 }
@@ -132,23 +130,23 @@ async function birthTransaction(
   prepared: {
     actorPrincipalId: string;
     fingerprint: Uint8Array;
-    termsNode: ReturnType<typeof parseStrictJsonText>;
+    termsNode: JsonNode;
     termsCanonicalBytes: Uint8Array;
   },
 ): Promise<CreateFormalDealResult> {
-  // §5.3 — one PostgreSQL clock_timestamp() captured inside the transaction immediately before
-  // authoritative birth validation and writes, used for every timestamp this command writes.
-  const commandTime = await captureCommandTime(sql);
-
   const claim = await claimIdempotency(sql, {
     recordId: ports.newUuidV7(),
     scope: principalScope(prepared.actorPrincipalId),
     commandType: 'CreateFormalDeal',
     idempotencyKey: input.idempotencyKey,
     fingerprint: prepared.fingerprint,
-    commandTime,
   });
   if (claim.status === 'REPLAY') return replayResult(claim.stored.outcome);
+
+  // §5.3 — one PostgreSQL clock_timestamp() captured inside the birth transaction immediately
+  // before authoritative birth validation and writes, used for every timestamp this command
+  // writes.
+  const commandTime = await captureCommandTime(sql);
 
   // ---- actor / self-deal / target checks ----
   const dealType = requireDealType(input.dealType);
@@ -214,21 +212,19 @@ async function birthTransaction(
     ],
   );
 
-  const creatorSlotId = ports.newUuidV7();
-  const counterpartySlotId = ports.newUuidV7();
   await sql.query(
     `INSERT INTO "DealPartySlot"
        ("id","dealId","dealType","slotKind","role","principalId","pendingInviteId","createdAt","boundAt")
      VALUES ($1,$2,$3::"DealType",'CREATOR',$4::"PartyRole",$5,NULL,$6,$6),
             ($7,$2,$3::"DealType",'COUNTERPARTY',$8::"PartyRole",$9,$10,$6,$11)`,
     [
-      creatorSlotId,
+      ports.newUuidV7(),
       dealId,
       dealType,
       input.creatorRole,
       prepared.actorPrincipalId,
       commandTime,
-      counterpartySlotId,
+      ports.newUuidV7(),
       counterpartyRole,
       target.kind === 'PRINCIPAL' ? target.principalId : null,
       target.kind === 'PENDING_INVITE' ? target.pendingInviteId : null,
@@ -238,48 +234,37 @@ async function birthTransaction(
 
   // §14 — the revision creator's acceptance is a real immutable row written in the same
   // transaction as the revision, never a UI simulation or a later derived assumption.
-  await sql.query(
-    `INSERT INTO "RevisionResponse"
-       ("id","dealId","revisionId","principalId","responseKind","responseOrigin","createdAt")
-     VALUES ($1,$2,$3,$4,'ACCEPT','REVISION_CREATOR_AUTO',$5)`,
-    [ports.newUuidV7(), dealId, revisionId, prepared.actorPrincipalId, commandTime],
-  );
+  await insertResponse(sql, ports, {
+    dealId,
+    revisionId,
+    principalId: prepared.actorPrincipalId,
+    responseKind: 'ACCEPT',
+    responseOrigin: 'REVISION_CREATOR_AUTO',
+    commandTime,
+  });
 
   const actorScope = principalScope(prepared.actorPrincipalId);
-  await appendAudit(sql, ports, {
-    dealId,
-    eventType: 'DEAL_CREATED',
-    actorScope,
-    targetRevisionId: revisionId,
-    commandTime,
-    dealVersion: 1,
-    correlationId: input.correlationId,
-    metadata: { publicReference, dealType },
+  const audit = (eventType: string, metadata: Record<string, unknown>): Promise<void> =>
+    appendAuditEvent(sql, ports, {
+      dealId,
+      eventType,
+      actorScope,
+      targetRevisionId: revisionId,
+      commandTime,
+      dealVersion: 1,
+      correlationId: input.correlationId,
+      metadata,
+    });
+  await audit('DEAL_CREATED', { publicReference, dealType });
+  // Safe metadata only: the revision hash, never the terms payload itself (§26).
+  await audit('REVISION_CREATED', {
+    revisionNumber: 1,
+    integrityFingerprint: hex(integrity.integrityFingerprint),
   });
-  await appendAudit(sql, ports, {
-    dealId,
-    eventType: 'REVISION_CREATED',
-    actorScope,
-    targetRevisionId: revisionId,
-    commandTime,
-    dealVersion: 1,
-    correlationId: input.correlationId,
-    // Safe metadata only: the revision hash, never the terms payload itself (§26).
-    metadata: { revisionNumber: 1, integrityFingerprint: hex(integrity.integrityFingerprint) },
-  });
-  await appendAudit(sql, ports, {
-    dealId,
-    eventType: 'REVISION_ACCEPTED_AUTO',
-    actorScope,
-    targetRevisionId: revisionId,
-    commandTime,
-    dealVersion: 1,
-    correlationId: input.correlationId,
-    metadata: { revisionNumber: 1 },
-  });
+  await audit('REVISION_ACCEPTED_AUTO', { revisionNumber: 1 });
 
-  // Only immutable commit-time facts are stored; `replayed` is a per-call property of the
-  // response, never a stored fact (§22.5).
+  // Only immutable commit-time facts are stored; `replayed` is a property of the response, not a
+  // stored fact (§22.5).
   const committedFacts = {
     dealId,
     publicReference,
@@ -289,7 +274,7 @@ async function birthTransaction(
     sentAt: commandTime.toISOString(),
     inviteExpiresAt: inviteExpiresAt.toISOString(),
   };
-  await settleIdempotency(sql, claim.recordId, 'SUCCESS', committedFacts);
+  await settleIdempotency(sql, claim.recordId, 'SUCCESS', commandTime, committedFacts);
   return { ...committedFacts, replayed: false };
 }
 
@@ -304,36 +289,4 @@ function replayResult(outcome: Record<string, unknown>): CreateFormalDealResult 
     inviteExpiresAt: String(outcome.inviteExpiresAt),
     replayed: true,
   };
-}
-
-export type AuditInput = Readonly<{
-  dealId: string;
-  eventType: string;
-  actorScope: string;
-  targetRevisionId: string | null;
-  commandTime: Date;
-  dealVersion: number;
-  correlationId: string;
-  metadata: Record<string, unknown>;
-}>;
-
-/** §26 — every meaningful committed write appends an audit event in the same transaction. */
-export async function appendAudit(sql: Sql, ports: KernelPorts, event: AuditInput): Promise<void> {
-  await sql.query(
-    `INSERT INTO "DealAgreementAuditEvent"
-       ("id","dealId","eventType","actorScope","targetRevisionId","commandTime","dealVersion",
-        "correlationId","metadata")
-     VALUES ($1,$2,$3::"DealAuditEventType",$4,$5,$6,$7,$8,$9::jsonb)`,
-    [
-      ports.newUuidV7(),
-      event.dealId,
-      event.eventType,
-      event.actorScope,
-      event.targetRevisionId,
-      event.commandTime,
-      event.dealVersion,
-      event.correlationId,
-      JSON.stringify(event.metadata),
-    ],
-  );
 }

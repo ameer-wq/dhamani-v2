@@ -41,7 +41,53 @@
     "INV-000-023": ["spec000_evidence_registry_self_test"],
     "INV-000-024": ["spec000_toolchain_versions_are_enforced"],
     "INV-000-025": ["spec000_env_files_are_gitignored"],
-    "INV-000-026": ["spec000_production_rejects_dev_configuration"]
+    "INV-000-026": ["spec000_production_rejects_dev_configuration"],
+    "INV-001-001": ["spec001_v1_deal_type_registry_is_exact_and_no_deposit"],
+    "INV-001-002": ["spec001_role_pair_is_server_derived_per_deal"],
+    "INV-001-003": ["spec001_same_principal_cannot_bind_both_slots"],
+    "INV-001-004": ["spec001_committed_deal_has_exactly_two_party_slots"],
+    "INV-001-005": ["spec001_deal_birth_is_all_or_nothing"],
+    "INV-001-006": ["spec001_formal_identity_fields_cannot_be_mutated"],
+    "INV-001-007": ["spec001_pending_invite_is_opaque_and_one_time_bind"],
+    "INV-001-008": ["spec001_invitation_expiry_is_server_authoritative_168h"],
+    "INV-001-009": ["spec001_first_mutual_acceptance_consumes_invitation_expiry"],
+    "INV-001-010": ["spec001_revision_rejects_update_delete_truncate_direct_sql"],
+    "INV-001-011": ["spec001_revision_chain_is_linear_and_same_deal"],
+    "INV-001-012": ["spec001_concurrent_successor_race_has_one_winner"],
+    "INV-001-013": ["spec001_revision_creator_auto_accepts_exact_revision"],
+    "INV-001-014": ["spec001_acceptance_is_exact_revision_only"],
+    "INV-001-015": ["spec001_successor_makes_prior_acceptance_stale_not_deleted"],
+    "INV-001-016": ["spec001_agreement_ready_is_strictly_derived"],
+    "INV-001-017": ["spec001_client_terms_cannot_author_domain_authority"],
+    "INV-001-018": ["spec001_reject_terminates_deal_negotiation"],
+    "INV-001-019": ["spec001_invitation_withdraw_preconditions_are_strict"],
+    "INV-001-020": ["spec001_successor_creator_can_terminally_withdraw_waiting_negotiation"],
+    "INV-001-021": ["spec001_modification_credits_are_history_derived_and_bounded"],
+    "INV-001-022": ["spec001_negotiation_is_turn_based"],
+    "INV-001-023": ["spec001_public_reference_unique_stable_and_collision_safe"],
+    "INV-001-024": ["spec001_terms_fingerprint_is_jcs_sha256_deterministic"],
+    "INV-001-025": ["spec001_contract_text_is_preserved_exactly"],
+    "INV-001-026": ["spec001_terms_envelope_is_bounded_and_schema_bound"],
+    "INV-001-027": ["spec001_all_write_commands_are_idempotent"],
+    "INV-001-028": ["spec001_idempotency_key_payload_change_conflicts"],
+    "INV-001-029": ["spec001_writes_are_deal_scoped_not_global_lock"],
+    "INV-001-030": ["spec001_stale_action_loses_with_typed_conflict"],
+    "INV-001-031": ["spec001_runtime_role_cannot_bypass_db_protections"],
+    "INV-001-032": ["spec001_domain_write_and_audit_commit_atomically"],
+    "INV-001-033": ["spec001_restart_persistence_preserves_agreement_truth"],
+    "INV-001-034": ["spec001_payer_role_is_deterministic_and_money_absent"],
+    "INV-001-035": ["spec001_has_no_untrusted_principal_http_authority"],
+    "INV-001-036": ["spec001_zero_financial_execution_surface"],
+    "INV-001-037": ["spec001_current_revision_fk_is_nonnull_same_deal_and_deferred"],
+    "INV-001-038": ["spec001_command_time_is_single_db_value_after_lock"],
+    "INV-001-039": ["spec001_revision_integrity_failure_fails_closed"],
+    "INV-001-040": ["spec001_entity_ids_are_server_uuidv7_only"],
+    "INV-001-041": ["spec001_audit_and_logs_contain_no_terms_or_pii"],
+    "INV-001-042": ["spec001_reads_require_authorized_actor_scope"],
+    "INV-001-043": ["spec001_e39_four_way_conflicting_action_race"],
+    "INV-001-044": ["spec001_e40_expiry_materializer_after_timer_consumed"],
+    "INV-001-045": ["spec001_e41_pending_bind_terminal_race"],
+    "INV-001-046": ["spec001_e42_idempotent_replay_after_later_state_change"]
   },
   "executionOrder": [
     "pnpm install --frozen-lockfile",
@@ -104,7 +150,10 @@
       "kind": "static_validator",
       "command": "pnpm boundaries:check"
     },
-    "spec000_runtime_mode_fail_closed": { "kind": "automated_test", "command": "pnpm test" },
+    "spec000_runtime_mode_fail_closed": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
     "spec000_process_env_access_is_config_only": {
       "kind": "static_validator",
       "command": "pnpm boundaries:check"
@@ -141,7 +190,10 @@
       "kind": "runtime_integration_check",
       "command": "pnpm spec000:migration:verify"
     },
-    "spec000_no_db_push_in_production_or_ci": { "kind": "automated_test", "command": "pnpm test" },
+    "spec000_no_db_push_in_production_or_ci": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
     "spec000_api_has_no_product_routes": {
       "kind": "static_validator",
       "command": "pnpm spec000:zero-product-logic:verify"
@@ -154,7 +206,10 @@
       "kind": "automated_test",
       "command": "pnpm test"
     },
-    "spec000_scripts_are_cross_platform": { "kind": "automated_test", "command": "pnpm test" },
+    "spec000_scripts_are_cross_platform": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
     "spec000_required_ci_definition_fail_closed": {
       "kind": "static_validator",
       "command": "pnpm spec000:ci-definition:verify"
@@ -195,10 +250,417 @@
       "kind": "static_validator",
       "command": "pnpm toolchain:verify"
     },
-    "spec000_env_files_are_gitignored": { "kind": "automated_test", "command": "pnpm test" },
+    "spec000_env_files_are_gitignored": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
     "spec000_production_rejects_dev_configuration": {
       "kind": "automated_test",
       "command": "pnpm test"
+    },
+    "spec001_v1_deal_type_registry_is_exact_and_no_deposit": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_role_pair_is_server_derived_per_deal": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_same_principal_cannot_bind_both_slots": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_committed_deal_has_exactly_two_party_slots": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_deal_birth_is_all_or_nothing": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_formal_identity_fields_cannot_be_mutated": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_pending_invite_is_opaque_and_one_time_bind": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_invitation_expiry_is_server_authoritative_168h": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_first_mutual_acceptance_consumes_invitation_expiry": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_revision_rejects_update_delete_truncate_direct_sql": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_revision_chain_is_linear_and_same_deal": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_concurrent_successor_race_has_one_winner": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_revision_creator_auto_accepts_exact_revision": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_acceptance_is_exact_revision_only": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_successor_makes_prior_acceptance_stale_not_deleted": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_agreement_ready_is_strictly_derived": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_client_terms_cannot_author_domain_authority": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_reject_terminates_deal_negotiation": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_invitation_withdraw_preconditions_are_strict": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_successor_creator_can_terminally_withdraw_waiting_negotiation": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_modification_credits_are_history_derived_and_bounded": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_negotiation_is_turn_based": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_public_reference_unique_stable_and_collision_safe": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_terms_fingerprint_is_jcs_sha256_deterministic": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_contract_text_is_preserved_exactly": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_terms_envelope_is_bounded_and_schema_bound": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_all_write_commands_are_idempotent": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_idempotency_key_payload_change_conflicts": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_writes_are_deal_scoped_not_global_lock": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_stale_action_loses_with_typed_conflict": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_runtime_role_cannot_bypass_db_protections": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_domain_write_and_audit_commit_atomically": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_restart_persistence_preserves_agreement_truth": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_payer_role_is_deterministic_and_money_absent": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_has_no_untrusted_principal_http_authority": {
+      "kind": "static_validator",
+      "command": "pnpm spec000:zero-product-logic:verify"
+    },
+    "spec001_zero_financial_execution_surface": {
+      "kind": "static_validator",
+      "command": "pnpm spec000:zero-product-logic:verify"
+    },
+    "spec001_current_revision_fk_is_nonnull_same_deal_and_deferred": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_command_time_is_single_db_value_after_lock": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_revision_integrity_failure_fails_closed": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_entity_ids_are_server_uuidv7_only": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_audit_and_logs_contain_no_terms_or_pii": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_reads_require_authorized_actor_scope": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e39_four_way_conflicting_action_race": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e40_expiry_materializer_after_timer_consumed": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e41_pending_bind_terminal_race": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e42_idempotent_replay_after_later_state_change": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_runtime_connection_role_is_nonowner_least_privilege": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_expiry_latch_replays_invitation_expired_consistently": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_raw_terms_cap_rejects_before_decode": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_terminal_error_payload_exposes_termination_reason": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e01_formal_birth": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e02_create_retries_sequential_and_concurrent": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e03_create_key_payload_mutation": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e04_same_principal_both_sides": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e05_pending_counterparty_birth": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e06_one_time_binding": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e07_bind_after_expiry": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e08_direct_r1_accept": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e09_r1_reject_terminal": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e10_r1_withdraw_accept_race": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e11_view_does_not_block_withdrawal": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e12_successor_proposal": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e13_successor_accept_no_deadlock": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e14_stale_accept_race": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e15_concurrent_successor_no_fork": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e16_turn_based_spam_blocked": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e17_unchanged_proposal_no_credit": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e18_modification_limits": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e19_response_loss_replay": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e20_duplicate_accept_retry": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e21_awaited_accept_concurrent_double_submit": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e22_exact_expiry_boundary_single_db_time": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e23_mutual_accept_before_expiry_consumes_timer": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e24_reshare_cannot_move_invite_time": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e25_r2_proposer_withdrawal": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e26_cross_deal_revision_abuse": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e27_roles_are_per_deal": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e28_append_only_runtime_role_bypass_attacks": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e29_participant_db_attacks": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e30_current_revision_cross_deal_corruption": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e31_birth_failure_injection_matrix": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e32_successor_failure_rollback": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e33_real_restart_preserves_truth": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e34_jcs_key_order_and_whitespace": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e35_contract_string_distinction": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e36_terms_payload_bounds": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e37_unsupported_schema_fail_closed": {
+      "kind": "automated_test",
+      "command": "pnpm test"
+    },
+    "spec001_e38_terms_authority_smuggling_is_inert": {
+      "kind": "automated_test",
+      "command": "pnpm test"
     }
+  },
+  "spec001RequiredEvidence": {
+    "r2CleanIncorporation": [
+      "spec001_runtime_connection_role_is_nonowner_least_privilege",
+      "spec001_expiry_latch_replays_invitation_expired_consistently",
+      "spec001_raw_terms_cap_rejects_before_decode",
+      "spec001_terminal_error_payload_exposes_termination_reason"
+    ],
+    "earthquakeScenarios": [
+      "spec001_e01_formal_birth",
+      "spec001_e02_create_retries_sequential_and_concurrent",
+      "spec001_e03_create_key_payload_mutation",
+      "spec001_e04_same_principal_both_sides",
+      "spec001_e05_pending_counterparty_birth",
+      "spec001_e06_one_time_binding",
+      "spec001_e07_bind_after_expiry",
+      "spec001_e08_direct_r1_accept",
+      "spec001_e09_r1_reject_terminal",
+      "spec001_e10_r1_withdraw_accept_race",
+      "spec001_e11_view_does_not_block_withdrawal",
+      "spec001_e12_successor_proposal",
+      "spec001_e13_successor_accept_no_deadlock",
+      "spec001_e14_stale_accept_race",
+      "spec001_e15_concurrent_successor_no_fork",
+      "spec001_e16_turn_based_spam_blocked",
+      "spec001_e17_unchanged_proposal_no_credit",
+      "spec001_e18_modification_limits",
+      "spec001_e19_response_loss_replay",
+      "spec001_e20_duplicate_accept_retry",
+      "spec001_e21_awaited_accept_concurrent_double_submit",
+      "spec001_e22_exact_expiry_boundary_single_db_time",
+      "spec001_e23_mutual_accept_before_expiry_consumes_timer",
+      "spec001_e24_reshare_cannot_move_invite_time",
+      "spec001_e25_r2_proposer_withdrawal",
+      "spec001_e26_cross_deal_revision_abuse",
+      "spec001_e27_roles_are_per_deal",
+      "spec001_e28_append_only_runtime_role_bypass_attacks",
+      "spec001_e29_participant_db_attacks",
+      "spec001_e30_current_revision_cross_deal_corruption",
+      "spec001_e31_birth_failure_injection_matrix",
+      "spec001_e32_successor_failure_rollback",
+      "spec001_e33_real_restart_preserves_truth",
+      "spec001_e34_jcs_key_order_and_whitespace",
+      "spec001_e35_contract_string_distinction",
+      "spec001_e36_terms_payload_bounds",
+      "spec001_e37_unsupported_schema_fail_closed",
+      "spec001_e38_terms_authority_smuggling_is_inert",
+      "spec001_e39_four_way_conflicting_action_race",
+      "spec001_e40_expiry_materializer_after_timer_consumed",
+      "spec001_e41_pending_bind_terminal_race",
+      "spec001_e42_idempotent_replay_after_later_state_change"
+    ]
   }
 }
