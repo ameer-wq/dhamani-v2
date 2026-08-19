@@ -494,7 +494,7 @@ describe('SPEC-001 negotiation lifecycle against real PostgreSQL', () => {
       [deal.dealId],
     );
     expect(events.rowCount).toBe(1);
-    expect(events.rows[0]!.commandTime.getTime()).toBe(row.terminatedAt.getTime());
+    expect(events.rows[0]!.commandTime.getTime()).toBe(row.terminatedAt!.getTime());
     // No contractual response was recorded for the refused action.
     expect(await responseRows(pool, deal.dealId)).toHaveLength(1);
   });

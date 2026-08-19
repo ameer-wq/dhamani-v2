@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   MAX_CANONICAL_BYTES,
   Spec001Error,
@@ -23,6 +22,7 @@ import {
   mapDatabaseError,
   withTransaction,
   type Sql,
+  type KernelDatabase,
 } from '../database.js';
 import { claimIdempotency, settleIdempotency } from '../idempotency-store.js';
 import { appendAuditEvent, insertResponse } from '../repository.js';
@@ -69,7 +69,7 @@ function hex(bytes: Uint8Array): string {
  * actor/self-deal/target checks -> schema/common/type validation -> atomic birth.
  */
 export async function createFormalDeal(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: CreateFormalDealInput,
 ): Promise<CreateFormalDealResult> {
@@ -265,24 +265,38 @@ async function birthTransaction(
 
   // Only immutable commit-time facts are stored; `replayed` is a property of the response, not a
   // stored fact (§22.5).
+  // §22.5 — stored under its immutable identity (`revisionId`: the R1 this birth created), not
+  // under a name that reads as the Deal's *current* revision. The caller-facing field keeps its
+  // contract name and is mapped from this immutable fact.
   const committedFacts = {
     dealId,
     publicReference,
-    currentRevisionId: revisionId,
+    revisionId,
     revisionNumber: 1,
     dealVersion: 1,
     sentAt: commandTime.toISOString(),
     inviteExpiresAt: inviteExpiresAt.toISOString(),
   };
   await settleIdempotency(sql, claim.recordId, 'SUCCESS', commandTime, committedFacts);
-  return { ...committedFacts, replayed: false };
+  // The caller-facing shape is built explicitly so the internal stored key never leaks into it.
+  return {
+    dealId: committedFacts.dealId,
+    publicReference: committedFacts.publicReference,
+    currentRevisionId: committedFacts.revisionId,
+    revisionNumber: committedFacts.revisionNumber,
+    dealVersion: committedFacts.dealVersion,
+    sentAt: committedFacts.sentAt,
+    inviteExpiresAt: committedFacts.inviteExpiresAt,
+    replayed: false,
+  };
 }
 
 function replayResult(outcome: Record<string, unknown>): CreateFormalDealResult {
   return {
     dealId: String(outcome.dealId),
     publicReference: String(outcome.publicReference),
-    currentRevisionId: String(outcome.currentRevisionId),
+    // Decoded from the immutable R1 identity committed by the original birth.
+    currentRevisionId: String(outcome.revisionId),
     revisionNumber: Number(outcome.revisionNumber),
     dealVersion: Number(outcome.dealVersion),
     sentAt: String(outcome.sentAt),

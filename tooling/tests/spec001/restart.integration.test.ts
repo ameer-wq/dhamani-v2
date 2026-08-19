@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { createPool } from '../../../apps/api/src/spec001/database.ts';
+import { createKernelDatabase } from '../../../apps/api/src/spec001/database.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
 import { proposeChanges } from '../../../apps/api/src/spec001/commands/propose-changes.ts';
 import {
@@ -21,6 +21,18 @@ import {
  * "restart test" that silently skipped the restart would be false-green evidence.
  */
 const CONTAINER = process.env.SPEC001_PG_CONTAINER ?? 'dhamani-spec001-pg';
+
+type SnapshotRow = {
+  publicReference: string;
+  currentRevisionId: string;
+  version: number;
+  firstMutualAcceptedAt: Date;
+  sentAt: Date;
+  inviteExpiresAt: Date;
+  fingerprint: string;
+  terms_bytes: string;
+  preimage_bytes: string;
+};
 
 const SNAPSHOT_SQL = `SELECT d."publicReference", d."currentRevisionId", d."version",
         d."firstMutualAcceptedAt", d."sentAt", d."inviteExpiresAt",
@@ -101,7 +113,7 @@ describe('SPEC-001 durability across a real restart', () => {
       idempotencyKey: randomUUID(),
     });
 
-    const before = await pool.query(SNAPSHOT_SQL, [deal.dealId]);
+    const before = await pool.query<SnapshotRow>(SNAPSHOT_SQL, [deal.dealId]);
     expect(before.rowCount).toBe(1);
     const snapshot = before.rows[0]!;
 
@@ -114,8 +126,8 @@ describe('SPEC-001 durability across a real restart', () => {
     expect(restartedAt).not.toBe(startedAt);
 
     // ---- reconnect with a fresh pool and re-verify ----
-    pool = createPool(requireConnectionString());
-    const after = await pool.query(SNAPSHOT_SQL, [deal.dealId]);
+    pool = createKernelDatabase(requireConnectionString());
+    const after = await pool.query<SnapshotRow>(SNAPSHOT_SQL, [deal.dealId]);
     expect(after.rowCount).toBe(1);
     const restored = after.rows[0]!;
 

@@ -3,7 +3,7 @@ import pg from 'pg';
 import { afterAll, describe, expect, it } from 'vitest';
 import { Spec001Error, verifyRevisionIntegrity } from '../../../packages/domain/src/index.ts';
 import { productionKernelPorts, sha256, uuidV7 } from '../../../apps/api/src/spec001/crypto.ts';
-import { createPool } from '../../../apps/api/src/spec001/database.ts';
+import { createKernelDatabase } from '../../../apps/api/src/spec001/database.ts';
 import { createFormalDeal } from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
 
 /**
@@ -14,7 +14,7 @@ const connectionString = process.env.SPEC001_DATABASE_URL ?? process.env.DATABAS
 if (!connectionString)
   throw new Error('SPEC-001 integration evidence requires DATABASE_URL or SPEC001_DATABASE_URL');
 
-const pool = createPool(connectionString);
+const pool = createKernelDatabase(connectionString);
 
 afterAll(async () => {
   await pool.end();
@@ -55,7 +55,17 @@ describe('SPEC-001 formal Deal birth against real PostgreSQL', () => {
     const result = await createFormalDeal(pool, productionKernelPorts, input);
     expect(result.replayed).toBe(false);
 
-    const deal = await pool.query(
+    const deal = await pool.query<{
+      id: string;
+      publicReference: string;
+      dealType: string;
+      currentRevisionId: string;
+      sentAt: Date;
+      inviteExpiresAt: Date;
+      firstMutualAcceptedAt: Date | null;
+      terminationReason: string | null;
+      version: number;
+    }>(
       `SELECT "id","publicReference","dealType"::text AS "dealType","currentRevisionId","sentAt",
               "inviteExpiresAt","firstMutualAcceptedAt","terminationReason","version"
          FROM "Deal" WHERE "id"=$1`,
@@ -88,7 +98,15 @@ describe('SPEC-001 formal Deal birth against real PostgreSQL', () => {
     expect(counterparty.role).toBe('SELLER');
 
     // R1 with no predecessor, and a verifiable integrity fingerprint.
-    const revision = await pool.query(
+    const revision = await pool.query<{
+      id: string;
+      revisionNumber: number;
+      predecessorRevisionId: string | null;
+      termsSchemaId: string;
+      termsPayloadCanonicalBytes: Uint8Array;
+      integrityPreimageCanonicalBytes: Uint8Array;
+      integrityFingerprint: Uint8Array;
+    }>(
       `SELECT "id","revisionNumber","predecessorRevisionId","termsSchemaId",
               "termsPayloadCanonicalBytes","integrityPreimageCanonicalBytes","integrityFingerprint"
          FROM "AgreementRevision" WHERE "dealId"=$1`,
@@ -127,7 +145,7 @@ describe('SPEC-001 formal Deal birth against real PostgreSQL', () => {
     expect(responses.rows[0]!.responseOrigin).toBe('REVISION_CREATOR_AUTO');
 
     // Audit trail written in the same transaction, carrying the resulting Deal version.
-    const audit = await pool.query(
+    const audit = await pool.query<{ eventType: string; dealVersion: number; commandTime: Date }>(
       `SELECT "eventType"::text AS "eventType","dealVersion","commandTime"
          FROM "DealAgreementAuditEvent" WHERE "dealId"=$1 ORDER BY "eventType"`,
       [result.dealId],
@@ -143,7 +161,10 @@ describe('SPEC-001 formal Deal birth against real PostgreSQL', () => {
       expect(event.commandTime.getTime()).toBe(row.sentAt.getTime());
     }
 
-    const idempotency = await pool.query(
+    const idempotency = await pool.query<{
+      outcomeKind: string;
+      outcome: Record<string, unknown>;
+    }>(
       `SELECT "outcomeKind","outcome" FROM "ApplicationIdempotencyRecord"
         WHERE "scope"=$1 AND "commandType"='CreateFormalDeal' AND "idempotencyKey"=$2`,
       [`PRINCIPAL:${input.actorPrincipalId}`, input.idempotencyKey],

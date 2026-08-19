@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   Spec001Error,
   computeIdempotencyFingerprint,
@@ -8,6 +7,7 @@ import {
   trustedIdentityScope,
   type KernelPorts,
 } from '@dhamani/domain';
+import type { KernelDatabase } from '../database.js';
 import {
   appendAuditEvent,
   assertCurrentRevisionIntegrity,
@@ -41,7 +41,7 @@ export type BindCounterpartyPrincipalResult = Readonly<{
  * preserved after binding as immutable provenance rather than cleared.
  */
 export async function bindCounterpartyPrincipal(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: BindCounterpartyPrincipalInput,
 ): Promise<BindCounterpartyPrincipalResult> {

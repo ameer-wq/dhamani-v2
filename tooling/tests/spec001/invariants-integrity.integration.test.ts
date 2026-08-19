@@ -1,11 +1,13 @@
-import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   MAX_RAW_BYTES,
   Spec001Error,
   TITLE_MAX_CODE_POINTS,
 } from '../../../packages/domain/src/index.ts';
-import { createPool } from '../../../apps/api/src/spec001/database.ts';
+import {
+  createKernelDatabase,
+  type KernelDatabase,
+} from '../../../apps/api/src/spec001/database.ts';
 import { uuidV7 } from '../../../apps/api/src/spec001/crypto.ts';
 import { createFormalDeal } from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
@@ -35,7 +37,7 @@ import {
 } from './helpers.ts';
 
 const pool = ownerPool();
-let runtime: pg.Pool;
+let runtime: KernelDatabase;
 
 beforeAll(async () => {
   await pool.query(
@@ -43,7 +45,7 @@ beforeAll(async () => {
   );
   // Must resolve through the shared helper: it targets the provisioned SPEC-001 evidence
   // database, not whatever DATABASE_URL happens to point at.
-  runtime = createPool(runtimeConnectionString());
+  runtime = createKernelDatabase(runtimeConnectionString());
 });
 
 afterAll(async () => {
@@ -698,7 +700,7 @@ describe('SPEC-001 integrity, idempotency and security invariants', () => {
     // One single command time shared by every timestamp the command wrote.
     expect(firstEvent!.commandTime.getTime()).toBe(secondEvent!.commandTime.getTime());
     const row = await dealRow(pool, deal.dealId);
-    expect(row.firstMutualAcceptedAt.getTime()).toBe(firstEvent!.commandTime.getTime());
+    expect(row.firstMutualAcceptedAt!.getTime()).toBe(firstEvent!.commandTime.getTime());
     const responses = await pool.query<{ createdAt: Date }>(
       `SELECT "createdAt" FROM "RevisionResponse" WHERE "dealId"=$1 AND "responseOrigin"='EXPLICIT'`,
       [deal.dealId],

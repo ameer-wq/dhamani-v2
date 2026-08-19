@@ -2,6 +2,9 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { Spec001Error } from '../../../packages/domain/src/index.ts';
 import {
   LOCK_TIMEOUT_MS,
+  TRANSACTION_TIMEOUT_MS,
+  createKernelDatabase,
+  withTransaction,
   isRetryableDatabaseError,
   isUniqueViolation,
   mapDatabaseError,
@@ -11,6 +14,7 @@ import { proposeChanges } from '../../../apps/api/src/spec001/commands/propose-c
 import {
   bornDeal,
   dealRow,
+  requireConnectionString,
   errorCodeOf,
   errorOf,
   ownerPool,
@@ -204,7 +208,6 @@ describe('SPEC-001 adversarial break probes', () => {
     for (const [name, rawTerms] of hostile) {
       const idempotencyKey = key();
       const code = await errorCodeOf(() =>
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         import('../../../apps/api/src/spec001/commands/create-formal-deal.ts').then((module) =>
           module.createFormalDeal(pool, ports, {
             actorPrincipalId,
@@ -229,5 +232,59 @@ describe('SPEC-001 adversarial break probes', () => {
       );
       expect(claims.rows[0]!.count, name).toBe(0);
     }
+  });
+
+  it('spec001_transaction_timeout_maps_to_retryable', async () => {
+    // The frozen §23.1 interactive-transaction timeout must actually abort work that overruns it,
+    // and must surface as the stable retryable contract rather than a raw Prisma error.
+    const started = Date.now();
+    let code = 'NO_ERROR_THROWN';
+    try {
+      await withTransaction(pool, async (sql) => {
+        // Cast away pg_sleep's void return so the probe fails on the timeout, not on decoding.
+        await sql.query(`SELECT pg_sleep(${(TRANSACTION_TIMEOUT_MS / 1000) * 2})::text AS slept`);
+      });
+    } catch (error) {
+      code = error instanceof Spec001Error ? error.code : `UNEXPECTED:${String(error)}`;
+      if (!(error instanceof Spec001Error)) code = mapDatabaseError(error).code;
+    }
+    expect(code).toBe('DEAL_WRITE_RETRYABLE');
+    // It was interrupted at roughly the configured timeout rather than running to completion.
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(TRANSACTION_TIMEOUT_MS - 1000);
+    expect(elapsed).toBeLessThan(TRANSACTION_TIMEOUT_MS * 1.8);
+  }, 120_000);
+
+  it('spec001_same_key_replay_after_reconnect_returns_original_outcome', async () => {
+    const deal = await bornDeal(pool, { title: 'Reconnect replay' });
+    const acceptKey = key();
+    const original = await acceptCurrentRevision(pool, ports, {
+      actorPrincipalId: deal.counterpartyId,
+      correlationId: randomUUID(),
+      dealId: deal.dealId,
+      targetRevisionId: deal.revisionId,
+      idempotencyKey: acceptKey,
+    });
+
+    // A completely fresh client/connection pool, as a restarted service would have.
+    const reconnected = createKernelDatabase(requireConnectionString());
+    try {
+      const replay = await acceptCurrentRevision(reconnected, ports, {
+        actorPrincipalId: deal.counterpartyId,
+        correlationId: randomUUID(),
+        dealId: deal.dealId,
+        targetRevisionId: deal.revisionId,
+        idempotencyKey: acceptKey,
+      });
+      expect(replay.replayed).toBe(true);
+      expect(replay.resultKind).toBe(original.resultKind);
+      expect(replay.dealVersion).toBe(original.dealVersion);
+      expect(replay.revisionId).toBe(original.revisionId);
+    } finally {
+      await reconnected.end();
+    }
+    // No duplicate effect survived the reconnect.
+    expect(await responseRows(pool, deal.dealId)).toHaveLength(2);
+    expect((await dealRow(pool, deal.dealId)).version).toBe(2);
   });
 });

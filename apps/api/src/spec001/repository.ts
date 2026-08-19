@@ -280,7 +280,9 @@ export async function bindCounterpartySlot(
   sql: Sql,
   input: { dealId: string; pendingInviteId: string; principalId: string; commandTime: Date },
 ): Promise<boolean> {
-  const result = await sql.query(
+  // `execute` is used rather than `query` because the affected-row count is the answer here: a
+  // statement without RETURNING yields no rows, so counting rows would always report failure.
+  const affected = await sql.execute(
     `UPDATE "DealPartySlot"
         SET "principalId" = $3, "boundAt" = $4
       WHERE "dealId" = $1
@@ -289,5 +291,5 @@ export async function bindCounterpartySlot(
         AND "principalId" IS NULL`,
     [input.dealId, input.pendingInviteId, input.principalId, input.commandTime],
   );
-  return (result.rowCount ?? 0) === 1;
+  return affected === 1;
 }

@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   MAX_CANONICAL_BYTES,
   Spec001Error,
@@ -19,6 +18,7 @@ import {
   validateTermsEnvelope,
   type KernelPorts,
 } from '@dhamani/domain';
+import type { KernelDatabase } from '../database.js';
 import {
   appendAuditEvent,
   assertCurrentRevisionIntegrity,
@@ -57,7 +57,7 @@ function hex(bytes: Uint8Array): string {
  * old revision: the old revision keeps its own immutable responses (§13).
  */
 export async function proposeChanges(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: ProposeChangesInput,
 ): Promise<ProposeChangesResult> {

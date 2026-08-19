@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   Spec001Error,
   isEffectivelyExpired,
@@ -8,7 +7,13 @@ import {
   type Spec001ErrorCode,
   type TerminationReason,
 } from '@dhamani/domain';
-import { captureCommandTime, mapDatabaseError, withTransaction, type Sql } from '../database.js';
+import {
+  captureCommandTime,
+  mapDatabaseError,
+  withTransaction,
+  type Sql,
+  type KernelDatabase,
+} from '../database.js';
 import { claimIdempotency, settleIdempotency } from '../idempotency-store.js';
 import {
   appendAuditEvent,
@@ -76,7 +81,7 @@ function storedTypedError(storedFacts: Record<string, unknown>): Spec001Error | 
  * and create a lock cycle.
  */
 export async function runKeyedDealCommand<T>(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   request: KeyedDealCommandRequest<T>,
 ): Promise<T> {

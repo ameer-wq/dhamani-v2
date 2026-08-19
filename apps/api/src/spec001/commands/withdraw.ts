@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   Spec001Error,
   computeIdempotencyFingerprint,
@@ -11,6 +10,7 @@ import {
   slotOf,
   type KernelPorts,
 } from '@dhamani/domain';
+import type { KernelDatabase } from '../database.js';
 import { appendAuditEvent, assertCurrentRevisionIntegrity, updateDeal } from '../repository.js';
 import { runKeyedDealCommand } from './shared.js';
 
@@ -33,7 +33,7 @@ export type WithdrawResult = Readonly<{
 type WithdrawKind = 'WithdrawInvitation' | 'WithdrawNegotiation';
 
 async function withdraw(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: WithdrawInput,
   commandType: WithdrawKind,
@@ -61,6 +61,7 @@ async function withdraw(
     dealId,
     correlationId: input.correlationId,
     actorScope: principalScope(actorPrincipalId),
+    // Decoded from the immutable committed result kind, never from current Deal state (§22.5).
     replay: (facts) => ({
       dealId: String(facts.dealId),
       revisionId: String(facts.revisionId),
@@ -104,7 +105,14 @@ async function withdraw(
           terminationReason,
           replayed: false,
         },
-        storedFacts: { dealId, revisionId: current.id, dealVersion, terminationReason },
+        // §22.5 — the immutable event/result kind this command committed, not a live projection.
+        storedFacts: {
+          dealId,
+          revisionId: current.id,
+          revisionNumber: current.revisionNumber,
+          dealVersion,
+          resultKind: terminationReason,
+        },
       };
     },
   });
@@ -118,7 +126,7 @@ async function withdraw(
  * No counterparty response row is fabricated by this command.
  */
 export async function withdrawInvitation(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: WithdrawInput,
 ): Promise<WithdrawResult> {
@@ -150,7 +158,7 @@ export async function withdrawInvitation(
  * the revision is not mutually accepted.
  */
 export async function withdrawNegotiation(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: WithdrawInput,
 ): Promise<WithdrawResult> {

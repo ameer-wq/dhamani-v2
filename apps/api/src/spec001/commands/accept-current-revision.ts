@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   Spec001Error,
   computeIdempotencyFingerprint,
@@ -10,6 +9,7 @@ import {
   responseBy,
   type KernelPorts,
 } from '@dhamani/domain';
+import type { KernelDatabase } from '../database.js';
 import {
   appendAuditEvent,
   assertCurrentRevisionIntegrity,
@@ -27,10 +27,49 @@ export type AcceptCurrentRevisionInput = Readonly<{
   idempotencyKey: string;
 }>;
 
+/**
+ * §22.5 — the immutable event/result kind committed by a successful Accept.
+ *
+ * §22.5 permits storing an "event/result kind" and explicitly forbids storing a live-derived
+ * projection such as `agreementReady`. This enum is that permitted kind: it records what the
+ * command *did* at commit time and can never drift, whereas a stored readiness flag would be a
+ * projection of Deal state. The caller-facing booleans are derived from it, so historical replay
+ * reproduces the original outcome without consulting current Deal state (E42 / INV-001-046).
+ */
+export const ACCEPT_RESULT_KINDS = [
+  'ACCEPT_RECORDED',
+  'MUTUAL_ACCEPTANCE_REACHED',
+  'FIRST_MUTUAL_ACCEPTANCE_REACHED',
+] as const;
+
+export type AcceptResultKind = (typeof ACCEPT_RESULT_KINDS)[number];
+
+function acceptResultKind(
+  mutuallyAccepted: boolean,
+  firstEverTransition: boolean,
+): AcceptResultKind {
+  if (!mutuallyAccepted) return 'ACCEPT_RECORDED';
+  return firstEverTransition ? 'FIRST_MUTUAL_ACCEPTANCE_REACHED' : 'MUTUAL_ACCEPTANCE_REACHED';
+}
+
+/** Derives the caller-facing booleans from the immutable committed result kind. */
+function acceptOutcomeOf(kind: AcceptResultKind): {
+  agreementReady: boolean;
+  firstMutualAcceptance: boolean;
+} {
+  return {
+    agreementReady: kind !== 'ACCEPT_RECORDED',
+    firstMutualAcceptance: kind === 'FIRST_MUTUAL_ACCEPTANCE_REACHED',
+  };
+}
+
 export type AcceptCurrentRevisionResult = Readonly<{
   dealId: string;
   revisionId: string;
+  revisionNumber: number;
   dealVersion: number;
+  /** The immutable committed result kind; the booleans below are derived from it. */
+  resultKind: AcceptResultKind;
   agreementReady: boolean;
   firstMutualAcceptance: boolean;
   replayed: boolean;
@@ -44,7 +83,7 @@ export type AcceptCurrentRevisionResult = Readonly<{
  * accepting whatever the current revision happens to be (E14).
  */
 export async function acceptCurrentRevision(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: AcceptCurrentRevisionInput,
 ): Promise<AcceptCurrentRevisionResult> {
@@ -64,14 +103,20 @@ export async function acceptCurrentRevision(
     dealId,
     correlationId: input.correlationId,
     actorScope: principalScope(actorPrincipalId),
-    replay: (facts) => ({
-      dealId: String(facts.dealId),
-      revisionId: String(facts.revisionId),
-      dealVersion: Number(facts.dealVersion),
-      agreementReady: Boolean(facts.agreementReady),
-      firstMutualAcceptance: Boolean(facts.firstMutualAcceptance),
-      replayed: true,
-    }),
+    replay: (facts) => {
+      // Decoded purely from immutable commit-time facts. Nothing here reads current Deal state,
+      // so a replay after later transitions still returns the original committed outcome.
+      const resultKind = facts.resultKind as AcceptResultKind;
+      return {
+        dealId: String(facts.dealId),
+        revisionId: String(facts.revisionId),
+        revisionNumber: Number(facts.revisionNumber),
+        dealVersion: Number(facts.dealVersion),
+        resultKind,
+        ...acceptOutcomeOf(resultKind),
+        replayed: true,
+      };
+    },
     execute: async ({ sql, snapshot, commandTime, dealRow, actorScope, correlationId }) => {
       // 7. actor authorization and required binding
       if (!isBoundParticipant(snapshot, actorPrincipalId))
@@ -147,21 +192,25 @@ export async function acceptCurrentRevision(
           metadata: { revisionNumber: current.revisionNumber, firstMutualAcceptance },
         });
 
+      const resultKind = acceptResultKind(agreementReady, firstMutualAcceptance);
       return {
         result: {
           dealId,
           revisionId: current.id,
+          revisionNumber: current.revisionNumber,
           dealVersion,
-          agreementReady,
-          firstMutualAcceptance,
+          resultKind,
+          ...acceptOutcomeOf(resultKind),
           replayed: false,
         },
+        // §22.5 — IDs, revision number, the authoritative Deal version and the immutable
+        // event/result kind only. No `agreementReady` and no terminal-state projection.
         storedFacts: {
           dealId,
           revisionId: current.id,
+          revisionNumber: current.revisionNumber,
           dealVersion,
-          agreementReady,
-          firstMutualAcceptance,
+          resultKind,
         },
       };
     },

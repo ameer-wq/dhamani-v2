@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import type pg from 'pg';
 import { Spec001Error } from '../../../packages/domain/src/index.ts';
 import { productionKernelPorts } from '../../../apps/api/src/spec001/crypto.ts';
-import { createPool } from '../../../apps/api/src/spec001/database.ts';
+import {
+  createKernelDatabase,
+  type KernelDatabase,
+} from '../../../apps/api/src/spec001/database.ts';
 import { createFormalDeal } from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
 
@@ -19,8 +21,8 @@ export function requireConnectionString(): string {
   return connectionString;
 }
 
-export function ownerPool(): pg.Pool {
-  return createPool(requireConnectionString());
+export function ownerPool(): KernelDatabase {
+  return createKernelDatabase(requireConnectionString());
 }
 
 /**
@@ -46,6 +48,31 @@ export function terms(title: string, extra: Record<string, unknown> = {}): Uint8
 
 export type Party = { principalId: string };
 
+/** Row shapes the evidence suites read back from PostgreSQL. */
+export type DealRow = {
+  id: string;
+  currentRevisionId: string;
+  firstMutualAcceptedAt: Date | null;
+  terminationReason: string | null;
+  terminatedAt: Date | null;
+  version: number;
+  sentAt: Date;
+  inviteExpiresAt: Date;
+};
+export type RevisionRow = {
+  id: string;
+  revisionNumber: number;
+  predecessorRevisionId: string | null;
+  createdByPrincipalId: string;
+  termsSchemaId: string;
+};
+export type ResponseRow = {
+  revisionId: string;
+  principalId: string;
+  responseKind: string;
+  responseOrigin: string;
+};
+
 export type BornDeal = {
   dealId: string;
   creatorId: string;
@@ -56,7 +83,7 @@ export type BornDeal = {
 
 /** Births a Deal with both slots already bound to distinct Principals. */
 export async function bornDeal(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   options: { dealType?: string; creatorRole?: string; termsSchemaId?: string; title?: string } = {},
 ): Promise<BornDeal> {
   const creatorId = randomUUID();
@@ -81,7 +108,7 @@ export async function bornDeal(
 }
 
 /** Births a Deal and drives it to first mutual acceptance of R1. */
-export async function mutuallyAcceptedDeal(pool: pg.Pool): Promise<BornDeal> {
+export async function mutuallyAcceptedDeal(pool: KernelDatabase): Promise<BornDeal> {
   const deal = await bornDeal(pool);
   await acceptCurrentRevision(pool, ports, {
     actorPrincipalId: deal.counterpartyId,
@@ -117,7 +144,7 @@ export async function errorOf(run: () => Promise<unknown>): Promise<Spec001Error
  * directly as owner. This is a clock-shifting fixture, not a product path: the kernel itself can
  * never move those fields, which the immutability trigger independently proves.
  */
-export async function backdateInvitation(pool: pg.Pool, dealId: string): Promise<void> {
+export async function backdateInvitation(pool: KernelDatabase, dealId: string): Promise<void> {
   const client = await pool.connect();
   try {
     // Disable, mutate and re-enable inside ONE transaction with a bounded lock_timeout. This
@@ -151,7 +178,7 @@ export async function backdateInvitation(pool: pg.Pool, dealId: string): Promise
  * statement, atomically. The kernel itself can never reach this state, which is the point.
  */
 export async function corruptRevisionBytes(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   statement: string,
   values: unknown[],
 ): Promise<void> {
@@ -175,18 +202,18 @@ export async function corruptRevisionBytes(
   }
 }
 
-export async function dealRow(pool: pg.Pool, dealId: string) {
-  const result = await pool.query(
+export async function dealRow(pool: KernelDatabase, dealId: string): Promise<DealRow> {
+  const result = await pool.query<DealRow>(
     `SELECT "id","currentRevisionId","firstMutualAcceptedAt",
             "terminationReason"::text AS "terminationReason","terminatedAt","version",
             "sentAt","inviteExpiresAt"
        FROM "Deal" WHERE "id"=$1`,
     [dealId],
   );
-  return result.rows[0];
+  return result.rows[0]!;
 }
 
-export async function auditEvents(pool: pg.Pool, dealId: string): Promise<string[]> {
+export async function auditEvents(pool: KernelDatabase, dealId: string): Promise<string[]> {
   const result = await pool.query<{ eventType: string }>(
     `SELECT "eventType"::text AS "eventType" FROM "DealAgreementAuditEvent"
       WHERE "dealId"=$1 ORDER BY "dealVersion", "eventType"`,
@@ -195,8 +222,8 @@ export async function auditEvents(pool: pg.Pool, dealId: string): Promise<string
   return result.rows.map((row) => row.eventType);
 }
 
-export async function revisionRows(pool: pg.Pool, dealId: string) {
-  const result = await pool.query(
+export async function revisionRows(pool: KernelDatabase, dealId: string): Promise<RevisionRow[]> {
+  const result = await pool.query<RevisionRow>(
     `SELECT "id","revisionNumber","predecessorRevisionId","createdByPrincipalId","termsSchemaId"
        FROM "AgreementRevision" WHERE "dealId"=$1 ORDER BY "revisionNumber"`,
     [dealId],
@@ -204,8 +231,8 @@ export async function revisionRows(pool: pg.Pool, dealId: string) {
   return result.rows;
 }
 
-export async function responseRows(pool: pg.Pool, dealId: string) {
-  const result = await pool.query(
+export async function responseRows(pool: KernelDatabase, dealId: string): Promise<ResponseRow[]> {
+  const result = await pool.query<ResponseRow>(
     `SELECT "revisionId","principalId","responseKind"::text AS "responseKind",
             "responseOrigin"::text AS "responseOrigin"
        FROM "RevisionResponse" WHERE "dealId"=$1`,

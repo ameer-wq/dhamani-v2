@@ -1,6 +1,8 @@
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/client"
+  // Prisma 7 requires a driver adapter for a direct PostgreSQL connection; the official
+  // adapter (@prisma/adapter-pg) is used by the application runtime. Output stays in
+  // node_modules so no generated source enters the repository or a workspace rootDir.
+  provider = "prisma-client-js"
 }
 
 datasource db {

@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   Spec001Error,
   deriveAgreementReady,
@@ -6,7 +5,7 @@ import {
   type DealSnapshot,
   type KernelPorts,
 } from '@dhamani/domain';
-import { captureCommandTime, withTransaction } from './database.js';
+import { captureCommandTime, withTransaction, type KernelDatabase } from './database.js';
 import { loadDealSnapshot, lockDeal } from './repository.js';
 
 /**
@@ -49,7 +48,7 @@ function assertAuthorized(scope: ActorScope, snapshot: DealSnapshot): void {
 }
 
 export async function readDeal(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   _ports: KernelPorts,
   scope: ActorScope,
   dealId: string,
@@ -79,7 +78,7 @@ export async function readDeal(
  * reference grants nothing on its own (§30).
  */
 export async function readDealByPublicReference(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   scope: ActorScope,
   publicReference: string,

@@ -17,6 +17,8 @@
     "@nestjs/common": "11.2.1",
     "@nestjs/core": "11.2.1",
     "@nestjs/platform-express": "11.2.1",
+    "@prisma/adapter-pg": "7.9.1",
+    "@prisma/client": "7.9.1",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2"
   },

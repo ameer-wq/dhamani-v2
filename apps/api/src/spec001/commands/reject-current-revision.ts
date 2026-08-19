@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   Spec001Error,
   computeIdempotencyFingerprint,
@@ -9,6 +8,7 @@ import {
   responseBy,
   type KernelPorts,
 } from '@dhamani/domain';
+import type { KernelDatabase } from '../database.js';
 import {
   appendAuditEvent,
   assertCurrentRevisionIntegrity,
@@ -41,7 +41,7 @@ export type RejectCurrentRevisionResult = Readonly<{
  * SPEC-001; history preserves enough context for a later policy.
  */
 export async function rejectCurrentRevision(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: RejectCurrentRevisionInput,
 ): Promise<RejectCurrentRevisionResult> {
@@ -61,6 +61,7 @@ export async function rejectCurrentRevision(
     dealId,
     correlationId: input.correlationId,
     actorScope: principalScope(actorPrincipalId),
+    // Decoded from the immutable committed result kind, never from current Deal state (§22.5).
     replay: (facts) => ({
       dealId: String(facts.dealId),
       revisionId: String(facts.revisionId),
@@ -119,7 +120,15 @@ export async function rejectCurrentRevision(
           terminationReason: 'REJECTED' as const,
           replayed: false,
         },
-        storedFacts: { dealId, revisionId: current.id, dealVersion, terminationReason: 'REJECTED' },
+        // §22.5 — IDs, revision number, Deal version and the immutable event/result kind this
+        // command committed. Not a projection of whatever the Deal's terminal state is now.
+        storedFacts: {
+          dealId,
+          revisionId: current.id,
+          revisionNumber: current.revisionNumber,
+          dealVersion,
+          resultKind: 'REJECTED',
+        },
       };
     },
   });

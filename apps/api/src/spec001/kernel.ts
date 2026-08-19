@@ -1,7 +1,6 @@
-import type pg from 'pg';
 import type { KernelPorts } from '@dhamani/domain';
 import { productionKernelPorts } from './crypto.js';
-import { createPool } from './database.js';
+import { createKernelDatabase, type KernelDatabase } from './database.js';
 import { acceptCurrentRevision } from './commands/accept-current-revision.js';
 import { bindCounterpartyPrincipal } from './commands/bind-counterparty-principal.js';
 import { createFormalDeal } from './commands/create-formal-deal.js';
@@ -42,7 +41,7 @@ export const SPEC001_KEYED_COMMAND_NAMES = SPEC001_COMMAND_NAMES.filter(
 );
 
 export type DealKernel = Readonly<{
-  pool: pg.Pool;
+  database: KernelDatabase;
   ports: KernelPorts;
   commands: typeof SPEC001_COMMANDS;
   assertReadiness: () => ReturnType<typeof assertContractualWriteReadiness>;
@@ -53,12 +52,12 @@ export function createDealKernel(
   connectionString: string,
   ports: KernelPorts = productionKernelPorts,
 ): DealKernel {
-  const pool = createPool(connectionString);
+  const database = createKernelDatabase(connectionString);
   return Object.freeze({
-    pool,
+    database,
     ports,
     commands: SPEC001_COMMANDS,
-    assertReadiness: () => assertContractualWriteReadiness(pool),
-    close: () => pool.end(),
+    assertReadiness: () => assertContractualWriteReadiness(database),
+    close: () => database.end(),
   });
 }

@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   Spec001Error,
   isEffectivelyExpired,
@@ -6,7 +5,12 @@ import {
   requireCanonicalUuid,
   type KernelPorts,
 } from '@dhamani/domain';
-import { captureCommandTime, mapDatabaseError, withTransaction } from '../database.js';
+import {
+  captureCommandTime,
+  mapDatabaseError,
+  withTransaction,
+  type KernelDatabase,
+} from '../database.js';
 import { lockDeal, toDealState } from '../repository.js';
 import { latchInvitationExpiry } from './shared.js';
 
@@ -33,7 +37,7 @@ export type ExpireInvitationIfDueResult = Readonly<{
  * a consumed timer harmless (E40).
  */
 export async function expireInvitationIfDue(
-  pool: pg.Pool,
+  pool: KernelDatabase,
   ports: KernelPorts,
   input: ExpireInvitationIfDueInput,
 ): Promise<ExpireInvitationIfDueResult> {

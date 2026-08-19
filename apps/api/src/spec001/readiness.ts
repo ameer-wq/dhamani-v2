@@ -1,4 +1,3 @@
-import type pg from 'pg';
 import {
   DENIED_TABLE_PRIVILEGES,
   SPEC001_TABLES,
@@ -6,6 +5,7 @@ import {
   type ReadinessVerdict,
   type RuntimeRoleFacts,
 } from '@dhamani/domain';
+import type { KernelDatabase } from './database.js';
 
 /**
  * §24.6 — before contractual-write readiness becomes healthy, the application interrogates the
@@ -16,10 +16,9 @@ import {
  * an unsafe production DATABASE_URL. Supplying an owner/migration credential here flips readiness
  * unhealthy, which is the required negative configuration.
  */
-export async function collectRuntimeRoleFacts(pool: pg.Pool): Promise<RuntimeRoleFacts> {
-  const client = await pool.connect();
-  try {
-    const identity = await client.query<{
+export async function collectRuntimeRoleFacts(database: KernelDatabase): Promise<RuntimeRoleFacts> {
+  {
+    const identity = await database.query<{
       current_user: string;
       is_superuser: boolean;
       can_bypass_rls: boolean;
@@ -32,7 +31,7 @@ export async function collectRuntimeRoleFacts(pool: pg.Pool): Promise<RuntimeRol
     const isSuperuser = identity.rows[0]?.is_superuser ?? true;
     const canBypassRls = identity.rows[0]?.can_bypass_rls ?? true;
 
-    const owners = await client.query<{ table_name: string; owner: string }>(
+    const owners = await database.query<{ table_name: string; owner: string }>(
       `SELECT c.relname AS table_name, pg_get_userbyid(c.relowner) AS owner
          FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -53,7 +52,7 @@ export async function collectRuntimeRoleFacts(pool: pg.Pool): Promise<RuntimeRol
         isMemberOfOwnerRole = true;
         continue;
       }
-      const membership = await client.query<{ is_member: boolean }>(
+      const membership = await database.query<{ is_member: boolean }>(
         'SELECT pg_has_role(current_user, $1, $2) AS is_member',
         [ownerRole, 'USAGE'],
       );
@@ -63,7 +62,7 @@ export async function collectRuntimeRoleFacts(pool: pg.Pool): Promise<RuntimeRol
     const heldDeniedPrivileges: Array<{ table: string; privilege: string }> = [];
     for (const table of observedTables) {
       for (const privilege of DENIED_TABLE_PRIVILEGES) {
-        const held = await client.query<{ held: boolean }>(
+        const held = await database.query<{ held: boolean }>(
           'SELECT has_table_privilege(current_user, $1, $2) AS held',
           [`public."${table}"`, privilege],
         );
@@ -81,11 +80,11 @@ export async function collectRuntimeRoleFacts(pool: pg.Pool): Promise<RuntimeRol
       canBypassTriggers: isSuperuser || canBypassRls,
       observedTables,
     });
-  } finally {
-    client.release();
   }
 }
 
-export async function assertContractualWriteReadiness(pool: pg.Pool): Promise<ReadinessVerdict> {
-  return evaluateRuntimeRoleReadiness(await collectRuntimeRoleFacts(pool));
+export async function assertContractualWriteReadiness(
+  database: KernelDatabase,
+): Promise<ReadinessVerdict> {
+  return evaluateRuntimeRoleReadiness(await collectRuntimeRoleFacts(database));
 }

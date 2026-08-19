@@ -1,4 +1,3 @@
-import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   SPEC001_TABLES,
@@ -8,12 +7,15 @@ import {
   assertContractualWriteReadiness,
   collectRuntimeRoleFacts,
 } from '../../../apps/api/src/spec001/readiness.ts';
-import { createPool } from '../../../apps/api/src/spec001/database.ts';
+import {
+  createKernelDatabase,
+  type KernelDatabase,
+} from '../../../apps/api/src/spec001/database.ts';
 import { uuidV7 } from '../../../apps/api/src/spec001/crypto.ts';
 import { bornDeal, ownerPool, randomUUID, runtimeConnectionString } from './helpers.ts';
 
 const owner = ownerPool();
-let runtime: pg.Pool;
+let runtime: KernelDatabase;
 
 const APPEND_ONLY_TABLES = ['AgreementRevision', 'RevisionResponse', 'DealAgreementAuditEvent'];
 
@@ -24,7 +26,7 @@ beforeAll(async () => {
        EXECUTE format('ALTER ROLE dhamani_runtime LOGIN PASSWORD %L', 'runtime_test_only');
      END $$;`,
   );
-  runtime = createPool(runtimeConnectionString());
+  runtime = createKernelDatabase(runtimeConnectionString());
 });
 
 afterAll(async () => {
