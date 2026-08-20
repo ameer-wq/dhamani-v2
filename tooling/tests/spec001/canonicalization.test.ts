@@ -6,10 +6,17 @@ import {
   canonicalizeValue,
 } from '../../../packages/domain/src/spec001/json/jcs.ts';
 import {
+  MAX_CANONICAL_BYTES,
   MAX_CHILD_NODES,
   MAX_DEPTH,
+  MAX_RAW_BYTES,
+  assertRawTermsWithinCap,
   parseStrictJsonText,
 } from '../../../packages/domain/src/spec001/json/strict-json.ts';
+import {
+  findTermsSchema,
+  validateTermsEnvelope,
+} from '../../../packages/domain/src/spec001/terms.ts';
 import { acceptJsonNumberToken } from '../../../packages/domain/src/spec001/json/number-serialization.ts';
 import { decimalTextsDenoteSameValue } from '../../../packages/domain/src/spec001/json/decimal.ts';
 
@@ -178,11 +185,42 @@ describe('SPEC-001 §11 canonicalization and accepted JSON domain', () => {
   });
 
   it('spec001_e36_terms_payload_bounds', () => {
+    // (1) raw >1 MiB rejects BEFORE decode. The payload is oversized AND syntactically invalid
+    // JSON, so if the cap did not run first the failure would surface as a parse/envelope error
+    // instead — the differing codes below are what prove the ordering.
+    const oversized = new Uint8Array(MAX_RAW_BYTES + 1).fill(0x78); // 'x' repeated
+    expect(codeOf(() => assertRawTermsWithinCap(oversized))).toBe('TERMS_PAYLOAD_TOO_LARGE');
+    const decodedInstead = codeOf(() => parseStrictJsonText(new TextDecoder().decode(oversized)));
+    expect(decodedInstead).toBe('INVALID_TERMS_ENVELOPE');
+    expect(decodedInstead).not.toBe('TERMS_PAYLOAD_TOO_LARGE');
+    // One byte under the cap passes the pre-decode gate and only then reaches the decoder.
+    expect(() => assertRawTermsWithinCap(new Uint8Array(MAX_RAW_BYTES).fill(0x78))).not.toThrow();
+
+    // (2) canonical >64 KiB rejects typed, after canonicalization.
+    const schema = findTermsSchema('dhamani.goods.v1')!;
+    const oversizedCanonical = JSON.stringify({
+      common: { title: 'Canonical cap probe' },
+      typeTerms: { blob: 'y'.repeat(MAX_CANONICAL_BYTES) },
+    });
+    // The raw form is under the 1 MiB cap, so this is genuinely the canonical bound firing.
+    expect(new TextEncoder().encode(oversizedCanonical).byteLength).toBeLessThan(MAX_RAW_BYTES);
+    expect(
+      codeOf(() => validateTermsEnvelope(parseStrictJsonText(oversizedCanonical), schema)),
+    ).toBe('TERMS_PAYLOAD_TOO_LARGE');
+    // Just under the canonical cap is accepted, so the bound is exact rather than blanket.
+    const withinCanonical = JSON.stringify({
+      common: { title: 'Canonical cap probe' },
+      typeTerms: { blob: 'y'.repeat(MAX_CANONICAL_BYTES - 200) },
+    });
+    expect(() => validateTermsEnvelope(parseStrictJsonText(withinCanonical), schema)).not.toThrow();
+
+    // (3) depth >32 rejects typed.
     const atDepth = '['.repeat(MAX_DEPTH - 1) + '1' + ']'.repeat(MAX_DEPTH - 1);
     const overDepth = '['.repeat(MAX_DEPTH) + '1' + ']'.repeat(MAX_DEPTH);
     expect(() => parseStrictJsonText(atDepth)).not.toThrow();
     expect(codeOf(() => parseStrictJsonText(overDepth))).toBe('TERMS_JSON_DEPTH_EXCEEDED');
 
+    // (4) node count >4096 rejects typed.
     const atNodes = `[${Array.from({ length: MAX_CHILD_NODES }, () => '1').join(',')}]`;
     const overNodes = `[${Array.from({ length: MAX_CHILD_NODES + 1 }, () => '1').join(',')}]`;
     expect(() => parseStrictJsonText(atNodes)).not.toThrow();

@@ -4,7 +4,10 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { Spec001Error, verifyRevisionIntegrity } from '../../../packages/domain/src/index.ts';
 import { productionKernelPorts, sha256, uuidV7 } from '../../../apps/api/src/spec001/crypto.ts';
 import { createKernelDatabase } from '../../../apps/api/src/spec001/database.ts';
-import { createFormalDeal } from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
+import {
+  createFormalDeal,
+  type CreateFormalDealResult,
+} from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
 
 /**
  * These are real-PostgreSQL integration tests. A missing DATABASE_URL fails loudly rather than
@@ -175,45 +178,134 @@ describe('SPEC-001 formal Deal birth against real PostgreSQL', () => {
   });
 
   it('spec001_e02_create_retries_sequential_and_concurrent', async () => {
-    const input = baseInput();
-    const first = await createFormalDeal(pool, productionKernelPorts, input);
-
-    // Sequential same-key retries must never create a second Deal.
-    for (let attempt = 0; attempt < 25; attempt += 1) {
-      const replay = await createFormalDeal(pool, productionKernelPorts, input);
-      expect(replay.dealId).toBe(first.dealId);
-      expect(replay.replayed).toBe(true);
-    }
-
-    // Overlapping concurrent same-key attempts: exactly one Deal, losers replay or report a
-    // documented safe outcome. These are genuinely concurrent real transactions.
-    const concurrent = await Promise.allSettled(
-      Array.from({ length: 32 }, () => createFormalDeal(pool, productionKernelPorts, input)),
-    );
-    const allowedLoserCodes = new Set([
-      'DEAL_WRITE_RETRYABLE',
+    // §22.4(B): for the SAME key with the SAME fingerprint the answer is the stored outcome.
+    // IDEMPOTENCY_CONFLICT is reserved for a *different* fingerprint, so seeing it here would
+    // mean the same semantic command had been given two meanings — it must fail this evidence.
+    const SAME_FINGERPRINT_LOSER_CODES = new Set([
       'IDEMPOTENT_REQUEST_IN_PROGRESS',
-      'IDEMPOTENCY_CONFLICT',
+      'DEAL_WRITE_RETRYABLE',
     ]);
-    for (const outcome of concurrent) {
-      if (outcome.status === 'fulfilled') expect(outcome.value.dealId).toBe(first.dealId);
-      else {
-        expect(outcome.reason).toBeInstanceOf(Spec001Error);
-        expect(allowedLoserCodes.has((outcome.reason as Spec001Error).code)).toBe(true);
+
+    // ---- A. 10,000 real sequential same-key, same-payload retries ----
+    const sequentialInput = baseInput();
+    const first = await createFormalDeal(pool, productionKernelPorts, sequentialInput);
+    expect(first.replayed).toBe(false);
+
+    // §22.4(D)/(E) instruct the caller to retry the same semantic command and key on a retryable
+    // or unresolved outcome, so the evidence follows that contract instead of treating a
+    // transient as divergence. A same-fingerprint conflict remains fatal (asserted below).
+    let transientRetries = 0;
+    const replayOnce = async (attempt: number): Promise<CreateFormalDealResult> => {
+      for (let tries = 0; tries < 5; tries += 1) {
+        try {
+          return await createFormalDeal(pool, productionKernelPorts, sequentialInput);
+        } catch (error) {
+          if (!(error instanceof Spec001Error)) throw error;
+          expect(error.code, 'same-key same-fingerprint must never conflict').not.toBe(
+            'IDEMPOTENCY_CONFLICT',
+          );
+          if (!SAME_FINGERPRINT_LOSER_CODES.has(error.code))
+            throw new Error(`sequential retry ${attempt} unexpected code ${error.code}`, {
+              cause: error,
+            });
+          transientRetries += 1;
+        }
       }
+      throw new Error(`sequential retry ${attempt} never converged`);
+    };
+
+    const SEQUENTIAL_RETRIES = 10_000;
+    for (let attempt = 0; attempt < SEQUENTIAL_RETRIES; attempt += 1) {
+      const replay = await replayOnce(attempt);
+      if (replay.dealId !== first.dealId || !replay.replayed)
+        throw new Error(
+          `sequential retry ${attempt} diverged: dealId=${replay.dealId} replayed=${replay.replayed}`,
+        );
+    }
+    // Transients are permitted by §22.4 but must not dominate; convergence is what matters.
+    expect(transientRetries).toBeLessThan(SEQUENTIAL_RETRIES / 10);
+
+    // Exactly one Deal, one idempotency identity, no duplicated domain effects.
+    const sequentialScope = `PRINCIPAL:${sequentialInput.actorPrincipalId}`;
+    const deals = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "Deal" WHERE "id"=$1`,
+      [first.dealId],
+    );
+    expect(deals.rows[0]!.count).toBe(1);
+    const claims = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "ApplicationIdempotencyRecord"
+          WHERE "scope"=$1 AND "commandType"='CreateFormalDeal' AND "idempotencyKey"=$2`,
+      [sequentialScope, sequentialInput.idempotencyKey],
+    );
+    expect(claims.rows[0]!.count).toBe(1);
+    const effects = await pool.query<{
+      revisions: number;
+      slots: number;
+      responses: number;
+      events: number;
+    }>(
+      `SELECT
+           (SELECT count(*)::int FROM "AgreementRevision" WHERE "dealId"=$1) AS revisions,
+           (SELECT count(*)::int FROM "DealPartySlot" WHERE "dealId"=$1) AS slots,
+           (SELECT count(*)::int FROM "RevisionResponse" WHERE "dealId"=$1) AS responses,
+           (SELECT count(*)::int FROM "DealAgreementAuditEvent" WHERE "dealId"=$1) AS events`,
+      [first.dealId],
+    );
+    expect(effects.rows[0]).toEqual({ revisions: 1, slots: 2, responses: 1, events: 3 });
+
+    // ---- B. >=100 genuinely overlapping attempts BEFORE any winner exists ----
+    // A fresh key/payload, launched together, so the real idempotency claim race is exercised
+    // rather than a replay of an already-committed Deal.
+    const CONCURRENT_ATTEMPTS = 120;
+    const contendedInput = baseInput({ rawTerms: termsFor('Birth contention race') });
+    const contended = await Promise.allSettled(
+      Array.from({ length: CONCURRENT_ATTEMPTS }, () =>
+        createFormalDeal(pool, productionKernelPorts, contendedInput),
+      ),
+    );
+
+    const winners = contended.filter(
+      (outcome) => outcome.status === 'fulfilled' && !outcome.value.replayed,
+    );
+    const replays = contended.filter(
+      (outcome) => outcome.status === 'fulfilled' && outcome.value.replayed,
+    );
+    const losers = contended.filter((outcome) => outcome.status === 'rejected');
+
+    // Exactly one attempt committed the Deal; everything else replayed it or failed safely.
+    expect(winners).toHaveLength(1);
+    const winnerDealId = (winners[0] as PromiseFulfilledResult<{ dealId: string }>).value.dealId;
+    for (const replay of replays)
+      expect((replay as PromiseFulfilledResult<{ dealId: string }>).value.dealId).toBe(
+        winnerDealId,
+      );
+    for (const loser of losers) {
+      const reason = (loser as PromiseRejectedResult).reason;
+      expect(reason).toBeInstanceOf(Spec001Error);
+      const code = (reason as Spec001Error).code;
+      // Explicitly forbidden for same key + same fingerprint (§22.4 B).
+      expect(code, 'same-key same-fingerprint must never conflict').not.toBe(
+        'IDEMPOTENCY_CONFLICT',
+      );
+      expect(SAME_FINGERPRINT_LOSER_CODES.has(code), `unexpected loser code ${code}`).toBe(true);
     }
 
-    const deals = await pool.query(`SELECT count(*)::int AS count FROM "Deal" WHERE "id"=$1`, [
-      first.dealId,
-    ]);
-    expect(deals.rows[0]!.count).toBe(1);
-    const created = await pool.query(
-      `SELECT count(*)::int AS count FROM "ApplicationIdempotencyRecord"
-        WHERE "scope"=$1 AND "commandType"='CreateFormalDeal' AND "idempotencyKey"=$2`,
-      [`PRINCIPAL:${input.actorPrincipalId}`, input.idempotencyKey],
+    // One Deal and one committed semantic meaning for the contended key.
+    const contendedScope = `PRINCIPAL:${contendedInput.actorPrincipalId}`;
+    const contendedClaims = await pool.query<{ count: number; outcomes: number }>(
+      `SELECT count(*)::int AS count, count(DISTINCT "outcome"::text)::int AS outcomes
+           FROM "ApplicationIdempotencyRecord"
+          WHERE "scope"=$1 AND "commandType"='CreateFormalDeal' AND "idempotencyKey"=$2`,
+      [contendedScope, contendedInput.idempotencyKey],
     );
-    expect(created.rows[0]!.count).toBe(1);
-  });
+    expect(contendedClaims.rows[0]!.count).toBe(1);
+    expect(contendedClaims.rows[0]!.outcomes).toBe(1);
+    const contendedDeals = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "Deal" WHERE "id"=$1`,
+      [winnerDealId],
+    );
+    expect(contendedDeals.rows[0]!.count).toBe(1);
+  }, 900_000);
 
   it('spec001_e03_create_key_payload_mutation', async () => {
     const input = baseInput();

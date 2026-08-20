@@ -43,11 +43,22 @@ export type ResponseState = Readonly<{
   responseOrigin: 'EXPLICIT' | 'REVISION_CREATOR_AUTO';
 }>;
 
+/**
+ * Result of validating the current revision's stored integrity material.
+ *
+ * §18 requires readiness to depend on the current revision *passing integrity validation*, not
+ * merely existing. This is a server-computed verdict produced by re-hashing the persisted bytes;
+ * it is never client-authored and never persisted, and `UNVERIFIED` is the fail-closed default so
+ * a snapshot assembled without doing the work can never report readiness.
+ */
+export type CurrentRevisionIntegrity = 'VERIFIED' | 'FAILED' | 'UNVERIFIED';
+
 export type DealSnapshot = Readonly<{
   deal: DealState;
   slots: readonly SlotState[];
   revisions: readonly RevisionState[];
   responses: readonly ResponseState[];
+  currentRevisionIntegrity: CurrentRevisionIntegrity;
 }>;
 
 /**
@@ -116,6 +127,9 @@ export function deriveAgreementReady(snapshot: DealSnapshot, commandTime: Date):
   if (new Set(principals).size !== 2) return false;
   const current = snapshot.revisions.find((candidate) => candidate.id === deal.currentRevisionId);
   if (!current) return false;
+  // §18 — the current revision must exist *and pass integrity validation*. Anything other than a
+  // positive verdict (including a snapshot that never performed the check) is not ready.
+  if (snapshot.currentRevisionIntegrity !== 'VERIFIED') return false;
   return principals.every((principalId) => {
     const response = responseBy(snapshot, current.id, principalId);
     return response !== undefined && response.responseKind === 'ACCEPT';

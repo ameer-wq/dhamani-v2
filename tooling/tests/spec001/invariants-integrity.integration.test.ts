@@ -12,6 +12,7 @@ import { uuidV7 } from '../../../apps/api/src/spec001/crypto.ts';
 import { createFormalDeal } from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
 import { bindCounterpartyPrincipal } from '../../../apps/api/src/spec001/commands/bind-counterparty-principal.ts';
+import { expireInvitationIfDue } from '../../../apps/api/src/spec001/commands/expire-invitation-if-due.ts';
 import { proposeChanges } from '../../../apps/api/src/spec001/commands/propose-changes.ts';
 import { rejectCurrentRevision } from '../../../apps/api/src/spec001/commands/reject-current-revision.ts';
 import {
@@ -901,7 +902,9 @@ describe('SPEC-001 integrity, idempotency and security invariants', () => {
   });
 
   it('spec001_e41_pending_bind_terminal_race', async () => {
-    for (let round = 0; round < 5; round += 1) {
+    // Frozen E41 requires bind raced against expiry, reject AND withdraw. Each variant runs
+    // repeatedly with genuinely overlapping commands, all through the real Deal row lock.
+    const pendingDeal = async (title: string) => {
       const pendingInviteId = randomUUID();
       const creatorId = randomUUID();
       const born = await createFormalDeal(pool, ports, {
@@ -911,19 +914,47 @@ describe('SPEC-001 integrity, idempotency and security invariants', () => {
         creatorRole: 'BUYER',
         counterpartyTarget: { kind: 'PENDING_INVITE', pendingInviteId },
         termsSchemaId: 'dhamani.goods.v1',
-        rawTerms: terms(`Bind race ${round}`),
+        rawTerms: terms(title),
         idempotencyKey: key(),
       });
-      const bindPrincipal = randomUUID();
+      return { born, creatorId, pendingInviteId };
+    };
 
-      // Pending bind races a terminal withdrawal by the creator.
+    const counterpartySlot = async (dealId: string) => {
+      const slot = await pool.query<{ principalId: string | null; boundAt: Date | null }>(
+        'SELECT "principalId","boundAt" FROM "DealPartySlot" WHERE "dealId"=$1 AND "slotKind"=$2',
+        [dealId, 'COUNTERPARTY'],
+      );
+      return slot.rows[0]!;
+    };
+
+    /** Every committed combination must be internally consistent, whichever order won. */
+    const assertLawful = async (dealId: string, winners: number) => {
+      const row = await dealRow(pool, dealId);
+      const slot = await counterpartySlot(dealId);
+      const bound = slot.principalId !== null;
+      // §23.4 — exactly one version increment per successful command, and no others.
+      expect(row.version).toBe(1 + winners);
+      // Never a half-bound slot.
+      expect(slot.principalId === null).toBe(slot.boundAt === null);
+      // §23.5 — an expired invite can never later bind.
+      if (row.terminationReason === 'INVITATION_EXPIRED') expect(bound).toBe(false);
+      const events = await auditEvents(pool, dealId);
+      for (const terminal of ['INVITATION_EXPIRED', 'INVITATION_WITHDRAWN', 'REVISION_REJECTED'])
+        expect(events.filter((event) => event === terminal).length).toBeLessThanOrEqual(1);
+      return { row, bound };
+    };
+
+    // ---- variant 1: bind vs WITHDRAW ----
+    for (let round = 0; round < 4; round += 1) {
+      const { born, creatorId, pendingInviteId } = await pendingDeal(`Bind vs withdraw ${round}`);
       const results = await Promise.allSettled([
         bindCounterpartyPrincipal(pool, ports, {
           trustedCaller: 'identity-service',
           correlationId: randomUUID(),
           dealId: born.dealId,
           pendingInviteId,
-          principalId: bindPrincipal,
+          principalId: randomUUID(),
           idempotencyKey: key(),
         }),
         withdrawInvitation(pool, ports, {
@@ -934,31 +965,107 @@ describe('SPEC-001 integrity, idempotency and security invariants', () => {
           idempotencyKey: key(),
         }),
       ]);
-      const winners = results.filter((result) => result.status === 'fulfilled').length;
-      for (const result of results)
-        if (result.status === 'rejected') expect(result.reason).toBeInstanceOf(Spec001Error);
+      for (const outcome of results)
+        if (outcome.status === 'rejected') expect(outcome.reason).toBeInstanceOf(Spec001Error);
+      const winners = results.filter((outcome) => outcome.status === 'fulfilled').length;
+      const { row, bound } = await assertLawful(born.dealId, winners);
+      if (row.terminationReason !== null && !bound)
+        expect(row.terminationReason).toBe('INVITATION_WITHDRAWN');
+    }
+
+    // ---- variant 2: bind vs EXPIRY (§23.5 "expired invite cannot later bind") ----
+    for (let round = 0; round < 4; round += 1) {
+      const { born, pendingInviteId } = await pendingDeal(`Bind vs expiry ${round}`);
+      await backdateInvitation(pool, born.dealId);
+      const results = await Promise.allSettled([
+        bindCounterpartyPrincipal(pool, ports, {
+          trustedCaller: 'identity-service',
+          correlationId: randomUUID(),
+          dealId: born.dealId,
+          pendingInviteId,
+          principalId: randomUUID(),
+          idempotencyKey: key(),
+        }),
+        expireInvitationIfDue(pool, ports, {
+          actorScope: 'SYSTEM:expiry',
+          correlationId: randomUUID(),
+          dealId: born.dealId,
+        }),
+      ]);
+
+      // The bind can never succeed against a due invitation; expiry is authoritative.
+      const bindOutcome = results[0]!;
+      expect(bindOutcome.status).toBe('rejected');
+      const bindError = (bindOutcome as PromiseRejectedResult).reason as Spec001Error;
+      expect(bindError).toBeInstanceOf(Spec001Error);
+      expect(['INVITATION_EXPIRED', 'DEAL_TERMINATED', 'DEAL_WRITE_RETRYABLE']).toContain(
+        bindError.code,
+      );
 
       const row = await dealRow(pool, born.dealId);
-      const slot = await pool.query<{ principalId: string | null }>(
-        `SELECT "principalId" FROM "DealPartySlot" WHERE "dealId"=$1 AND "slotKind"='COUNTERPARTY'`,
-        [born.dealId],
-      );
-      const bound = slot.rows[0]!.principalId !== null;
-      const terminal = row.terminationReason !== null;
-
-      // Both may serialize (bind then withdraw is lawful), but the combination is always
-      // consistent: a Deal terminated BEFORE the bind can never end up bound.
-      expect(row.version).toBe(1 + winners);
-      if (terminal && !bound) expect(row.terminationReason).toBe('INVITATION_WITHDRAWN');
-      // A bound slot always carries its boundAt, and never a half-bound state.
-      const pairing = await pool.query<{ count: number }>(
-        `SELECT count(*)::int AS count FROM "DealPartySlot"
-          WHERE "dealId"=$1 AND (("principalId" IS NULL) <> ("boundAt" IS NULL))`,
-        [born.dealId],
-      );
-      expect(pairing.rows[0]!.count).toBe(0);
+      expect(row.terminationReason).toBe('INVITATION_EXPIRED');
+      expect((await counterpartySlot(born.dealId)).principalId).toBeNull();
+      // Exactly one expiry materialization however the race resolved.
+      const events = await auditEvents(pool, born.dealId);
+      expect(events.filter((event) => event === 'INVITATION_EXPIRED')).toHaveLength(1);
+      expect(row.version).toBe(2);
     }
-  });
+
+    // ---- variant 3: bind vs REJECT by the Principal being bound ----
+    // Before binding, that Principal is an outsider and must fail safely; if the bind
+    // serialises first the reject may legitimately become authorized. Either committed
+    // combination must be lawful.
+    for (let round = 0; round < 4; round += 1) {
+      const { born, pendingInviteId } = await pendingDeal(`Bind vs reject ${round}`);
+      const incoming = randomUUID();
+      const results = await Promise.allSettled([
+        bindCounterpartyPrincipal(pool, ports, {
+          trustedCaller: 'identity-service',
+          correlationId: randomUUID(),
+          dealId: born.dealId,
+          pendingInviteId,
+          principalId: incoming,
+          idempotencyKey: key(),
+        }),
+        rejectCurrentRevision(pool, ports, {
+          actorPrincipalId: incoming,
+          correlationId: randomUUID(),
+          dealId: born.dealId,
+          targetRevisionId: born.currentRevisionId,
+          idempotencyKey: key(),
+        }),
+      ]);
+      for (const outcome of results)
+        if (outcome.status === 'rejected') expect(outcome.reason).toBeInstanceOf(Spec001Error);
+      const winners = results.filter((outcome) => outcome.status === 'fulfilled').length;
+      const { row, bound } = await assertLawful(born.dealId, winners);
+
+      const rejectOutcome = results[1]!;
+      if (rejectOutcome.status === 'fulfilled') {
+        // A reject can only have committed if the bind serialised first.
+        expect(bound).toBe(true);
+        expect(row.terminationReason).toBe('REJECTED');
+        const responses = await responseRows(pool, born.dealId);
+        expect(
+          responses.filter(
+            (response) => response.principalId === incoming && response.responseKind === 'REJECT',
+          ),
+        ).toHaveLength(1);
+      } else {
+        expect([
+          'NOT_DEAL_PARTICIPANT',
+          'DEAL_TERMINATED',
+          'DEAL_WRITE_RETRYABLE',
+          'IDEMPOTENT_REQUEST_IN_PROGRESS',
+        ]).toContain((rejectOutcome.reason as Spec001Error).code);
+        // No REJECT row may exist for a Principal that was never bound.
+        if (!bound) {
+          const responses = await responseRows(pool, born.dealId);
+          expect(responses.filter((response) => response.principalId === incoming)).toHaveLength(0);
+        }
+      }
+    }
+  }, 300_000);
 
   it('spec001_concurrent_successor_race_has_one_winner', async () => {
     for (let round = 0; round < 4; round += 1) {

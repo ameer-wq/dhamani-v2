@@ -152,29 +152,50 @@ export async function withTransaction<T>(
 
 type DriverFailure = Readonly<{ sqlState?: string; constraint?: string }>;
 
+type AdapterCause = Readonly<{ originalCode?: unknown; originalMessage?: unknown }>;
+
+function failureFromAdapterCause(cause: AdapterCause | undefined): DriverFailure | undefined {
+  if (!cause || typeof cause.originalCode !== 'string') return undefined;
+  const text = typeof cause.originalMessage === 'string' ? cause.originalMessage : '';
+  const named = /constraint "([^"]+)"/.exec(text)?.[1];
+  return { sqlState: cause.originalCode, ...(named ? { constraint: named } : {}) };
+}
+
 /**
  * Recovers the PostgreSQL SQLSTATE and constraint name from a failure.
  *
  * Prisma wraps raw-query failures as `P2010` and carries the original driver error underneath, so
  * the real SQLSTATE has to be unwrapped rather than read off the Prisma code. Plain node-postgres
  * errors, raised by the direct-DB evidence paths, are read directly.
+ *
+ * A third shape exists and must be decoded too. `@prisma/adapter-pg` issues the
+ * transaction-lifecycle statements — `BEGIN`, `SET TRANSACTION ISOLATION LEVEL`, savepoints and
+ * the engine's `COMMIT`/`ROLLBACK` — through its own `executeRaw`, whose failures are re-thrown
+ * from `PgTransaction.onError` as a bare `DriverAdapterError`. Those never pass through the query
+ * pipeline that produces `P2010`, and they carry the SQLSTATE on `cause.originalCode`. Without
+ * this branch a real §22.4 contention outcome (a `lock_timeout`/`statement_timeout` cancellation,
+ * or a lost connection, observed while the transaction was being started, committed or rolled
+ * back) escapes untyped and becomes a raw driver error at the caller contract, which §27 forbids.
  */
 export function driverFailureOf(error: unknown): DriverFailure | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
   const candidate = error as {
     code?: unknown;
     constraint?: unknown;
-    meta?: {
-      driverAdapterError?: { cause?: { originalCode?: unknown; originalMessage?: unknown } };
-    };
+    meta?: { driverAdapterError?: { cause?: AdapterCause } };
     message?: unknown;
+    name?: unknown;
+    cause?: unknown;
   };
 
-  const cause = candidate.meta?.driverAdapterError?.cause;
-  if (cause && typeof cause.originalCode === 'string') {
-    const text = typeof cause.originalMessage === 'string' ? cause.originalMessage : '';
-    const named = /constraint "([^"]+)"/.exec(text)?.[1];
-    return { sqlState: cause.originalCode, ...(named ? { constraint: named } : {}) };
+  const wrapped = failureFromAdapterCause(candidate.meta?.driverAdapterError?.cause);
+  if (wrapped) return wrapped;
+
+  if (candidate.name === 'DriverAdapterError' && typeof candidate.cause === 'object') {
+    const bare = failureFromAdapterCause(
+      (candidate.cause ?? undefined) as AdapterCause | undefined,
+    );
+    if (bare) return bare;
   }
 
   // Some raw failures only carry the SQLSTATE in the rendered Prisma message.
@@ -203,6 +224,12 @@ const RETRYABLE_SQLSTATES = new Set([
   '40P01', // deadlock_detected
   '55P03', // lock_not_available
   '57014', // query_canceled (statement_timeout / lock_timeout)
+  // in_failed_sql_transaction. The kernel never continues issuing statements after an in-flight
+  // failure — every command catches outside `withTransaction` — so this can only mean the pooled
+  // connection handed to this transaction was still inside an aborted block from an earlier
+  // victim. Nothing of this command executed, so it is retryable with the same key, and the
+  // adapter destroys that connection on this failure rather than returning it to the pool again.
+  '25P02',
   '08000', // connection_exception
   '08003', // connection_does_not_exist
   '08006', // connection_failure
@@ -256,7 +283,11 @@ export function mapDatabaseError(error: unknown): Spec001Error {
   const failure = driverFailureOf(error);
   if (failure?.sqlState === '23505') {
     const mapped = UNIQUE_VIOLATION_CODES.get(failure.constraint ?? '');
-    return new Spec001Error(mapped ?? 'REVISION_RESPONSE_CONFLICT', {
+    // An unrecognised unique constraint is re-thrown rather than described as an unrelated domain
+    // conflict. Labelling an unknown persistence failure `REVISION_RESPONSE_CONFLICT` would be a
+    // false stable contract, and the Frozen SPEC nowhere requires such a fallback.
+    if (!mapped) throw error;
+    return new Spec001Error(mapped, {
       ...(failure.constraint ? { field: failure.constraint } : {}),
     });
   }

@@ -10,10 +10,12 @@ import {
 } from '../../../apps/api/src/spec001/database.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
 import { proposeChanges } from '../../../apps/api/src/spec001/commands/propose-changes.ts';
+import { readDealByPublicReference } from '../../../apps/api/src/spec001/reads.ts';
 import {
   auditEvents,
   bornDeal,
   dealRow,
+  errorCodeOf,
   ownerPool,
   ports,
   randomUUID,
@@ -295,5 +297,47 @@ describe('SPEC-001 remediation — §23.1 Prisma transaction baseline', () => {
     expect(database).toContain('SET LOCAL lock_timeout');
     // A bare BEGIN would mean the Prisma transaction baseline had been bypassed.
     expect(database).not.toContain("'BEGIN ISOLATION LEVEL");
+  });
+
+  it('spec001_public_reference_is_not_an_existence_oracle', async () => {
+    // §28 — the reference lookup lives behind the authorization boundary and `publicReference`
+    // alone is never authorization. An outsider must therefore be unable to tell a real Deal
+    // reference from an invented one through this application service.
+    const deal = await bornDeal(pool, { title: 'Reference oracle probe' });
+    const outsider = { kind: 'PARTICIPANT' as const, principalId: randomUUID() };
+
+    const invented = 'DH-2222-3333-4444';
+    const realReferenceAnswer = await errorCodeOf(() =>
+      readDealByPublicReference(pool, ports, outsider, deal.publicReference),
+    );
+    const inventedReferenceAnswer = await errorCodeOf(() =>
+      readDealByPublicReference(pool, ports, outsider, invented),
+    );
+
+    // Identical answers: existence cannot be probed by a non-participant.
+    expect(realReferenceAnswer).toBe('NOT_DEAL_PARTICIPANT');
+    expect(inventedReferenceAnswer).toBe('NOT_DEAL_PARTICIPANT');
+    expect(inventedReferenceAnswer).toBe(realReferenceAnswer);
+
+    // A bound participant still reads their own Deal by reference.
+    const asParticipant = await readDealByPublicReference(
+      pool,
+      ports,
+      { kind: 'PARTICIPANT', principalId: deal.counterpartyId },
+      deal.publicReference,
+    );
+    expect(asParticipant.dealId).toBe(deal.dealId);
+
+    // A named trusted internal scope is authorized to learn the difference.
+    expect(
+      await errorCodeOf(() =>
+        readDealByPublicReference(
+          pool,
+          ports,
+          { kind: 'TRUSTED_SYSTEM', purpose: 'reference-audit' },
+          invented,
+        ),
+      ),
+    ).toBe('DEAL_NOT_FOUND');
   });
 });

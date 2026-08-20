@@ -110,7 +110,7 @@ export async function runKeyedDealCommand<T>(
       // §29 — exactly one clock_timestamp(), read after the lock so a lock wait cannot leave the
       // command reasoning about a stale instant.
       const commandTime = await captureCommandTime(sql);
-      const snapshot = await loadDealSnapshot(sql, dealRow);
+      const snapshot = await loadDealSnapshot(sql, dealRow, ports);
 
       if (isTerminal(snapshot.deal)) {
         const reason = snapshot.deal.terminationReason as TerminationReason;

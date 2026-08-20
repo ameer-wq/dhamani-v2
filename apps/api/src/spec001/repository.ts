@@ -1,5 +1,6 @@
 import {
   Spec001Error,
+  type CurrentRevisionIntegrity,
   verifyRevisionIntegrity,
   type DealSnapshot,
   type DealState,
@@ -57,8 +58,20 @@ export function toDealState(row: LockedDealRow): DealState {
   };
 }
 
-/** All Deal-scoped precondition state, read under the lock in one place (§23.1). */
-export async function loadDealSnapshot(sql: Sql, row: LockedDealRow): Promise<DealSnapshot> {
+/**
+ * All Deal-scoped precondition state, read under the lock in one place (§23.1).
+ *
+ * The current revision's integrity is validated here from the authoritative BYTEA columns and the
+ * verdict is carried on the snapshot, so §18 readiness can require a *passing* current revision
+ * rather than merely an existing one. The verdict is computed, never stored or client-supplied,
+ * and a failure is recorded rather than thrown so the caller can apply it at the correct §23.3
+ * precedence step.
+ */
+export async function loadDealSnapshot(
+  sql: Sql,
+  row: LockedDealRow,
+  ports: KernelPorts,
+): Promise<DealSnapshot> {
   const [slots, revisions, responses] = await Promise.all([
     sql.query<SlotState>(
       `SELECT "slotKind"::text AS "slotKind","role"::text AS "role","principalId",
@@ -78,11 +91,29 @@ export async function loadDealSnapshot(sql: Sql, row: LockedDealRow): Promise<De
       [row.id],
     ),
   ]);
+  // Computed here rather than defaulted, so a snapshot can only claim VERIFIED after the stored
+  // bytes were actually re-hashed. UNVERIFIED remains the fail-closed value for any other path.
+  const currentRevisionIntegrity: CurrentRevisionIntegrity = await assertCurrentRevisionIntegrity(
+    sql,
+    row.id,
+    row.dealType,
+    row.currentRevisionId,
+    ports,
+  ).then(
+    () => 'VERIFIED' as const,
+    (error: unknown) => {
+      if (error instanceof Spec001Error && error.code === 'REVISION_INTEGRITY_FAILURE')
+        return 'FAILED' as const;
+      throw error;
+    },
+  );
+
   return Object.freeze({
     deal: toDealState(row),
     slots: slots.rows,
     revisions: revisions.rows,
     responses: responses.rows,
+    currentRevisionIntegrity,
   });
 }
 

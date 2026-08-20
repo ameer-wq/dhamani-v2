@@ -93,8 +93,16 @@ describe('SPEC-001 adversarial break probes', () => {
     expect(violation('ApplicationIdempotencyRecord_claim_key').code).toBe(
       'IDEMPOTENT_REQUEST_IN_PROGRESS',
     );
-    // An unmapped constraint still yields a stable typed code, never a raw driver error.
-    expect(violation('some_future_constraint').code).toBe('REVISION_RESPONSE_CONFLICT');
+    // An UNRECOGNISED unique constraint must NOT be relabelled as an unrelated stable domain
+    // conflict. It is re-thrown, so an unknown persistence failure cannot masquerade as contract.
+    expect(() => violation('some_future_constraint')).toThrow();
+    let mislabelled: string | undefined;
+    try {
+      mislabelled = violation('some_future_constraint').code;
+    } catch {
+      mislabelled = undefined;
+    }
+    expect(mislabelled).toBeUndefined();
 
     // Every retryable SQLSTATE maps to the single retryable contract.
     for (const code of ['40001', '40P01', '55P03', '57014', '08006']) {

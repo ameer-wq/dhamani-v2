@@ -24,18 +24,51 @@ afterAll(async () => {
 
 const key = () => randomUUID();
 
-/** Codes a losing participant in a real race may legitimately receive. */
-const SAFE_LOSER_CODES = new Set([
+/**
+ * Permitted loser outcomes are declared per scenario, never as one broad set.
+ *
+ * A generic allowlist would accept codes that cannot logically arise in a given race and would
+ * therefore hide a regression behind a green test. In particular `IDEMPOTENCY_CONFLICT` is only
+ * legal for a *different* fingerprint under the same key (§22.4 B), so it never belongs in a
+ * same-semantic contention scenario.
+ */
+
+/** Transport-level outcomes §22.4(D)/(E) permit in any real race. */
+const CONTENTION_TRANSIENTS = ['DEAL_WRITE_RETRYABLE', 'IDEMPOTENT_REQUEST_IN_PROGRESS'] as const;
+
+/** E10 — withdraw vs accept on R1: whichever loses sees the other's committed progression. */
+const E10_LOSER_CODES = new Set<string>([
+  'DEAL_TERMINATED', // accept lost to the withdrawal
+  'WITHDRAW_NOT_ALLOWED', // withdrawal lost to the counterparty's contractual response
+  ...CONTENTION_TRANSIENTS,
+]);
+
+/** E15 — two successors from the same base by the same actor. */
+const E15_LOSER_CODES = new Set<string>([
+  'REVISION_NOT_CURRENT', // base is no longer current
+  'ACTOR_MUST_WAIT_FOR_COUNTERPARTY', // the actor now authored the current revision
+  ...CONTENTION_TRANSIENTS,
+]);
+
+/** §23.5 — same actor, DIFFERENT keys: the loser gets a deterministic already-responded/
+ *  current-state conflict, not an arbitrary error. */
+const E21_DIFFERENT_KEY_LOSER_CODES = new Set<string>([
+  'REVISION_ALREADY_RESPONDED',
+  'REVISION_NOT_CURRENT',
+  ...CONTENTION_TRANSIENTS,
+]);
+
+/** §22.4(B) — same key AND same fingerprint: a conflict is forbidden. */
+const SAME_FINGERPRINT_LOSER_CODES = new Set<string>([...CONTENTION_TRANSIENTS]);
+
+/** E39 — four conflicting commands against the same prior state. */
+const E39_LOSER_CODES = new Set<string>([
   'DEAL_TERMINATED',
   'REVISION_NOT_CURRENT',
   'REVISION_ALREADY_RESPONDED',
-  'ACTOR_MUST_WAIT_FOR_COUNTERPARTY',
-  'DEAL_WRITE_RETRYABLE',
-  'IDEMPOTENT_REQUEST_IN_PROGRESS',
-  'IDEMPOTENCY_CONFLICT',
-  'MODIFICATION_LIMIT_REACHED',
   'WITHDRAW_NOT_ALLOWED',
-  'REVISION_TERMS_UNCHANGED',
+  'ACTOR_MUST_WAIT_FOR_COUNTERPARTY',
+  ...CONTENTION_TRANSIENTS,
 ]);
 
 function classify(results: PromiseSettledResult<unknown>[]): {
@@ -114,7 +147,8 @@ describe('SPEC-001 concurrency with real overlapping transactions', () => {
       const { winners, loserCodes } = classify(results);
       // Exactly one authoritative progression: the Deal is either withdrawn or accepted.
       expect(winners).toBe(1);
-      for (const code of loserCodes) expect(SAFE_LOSER_CODES.has(code)).toBe(true);
+      for (const code of loserCodes)
+        expect(E10_LOSER_CODES.has(code), `E10 loser code ${code}`).toBe(true);
 
       const row = await dealRow(pool, deal.dealId);
       const withdrew = row.terminationReason === 'INVITATION_WITHDRAWN';
@@ -149,8 +183,10 @@ describe('SPEC-001 concurrency with real overlapping transactions', () => {
           idempotencyKey: key(),
         }),
       ]);
-      const { winners } = classify(results);
+      const { winners, loserCodes } = classify(results);
       expect(winners).toBe(1);
+      for (const code of loserCodes)
+        expect(E15_LOSER_CODES.has(code), `E15 loser code ${code}`).toBe(true);
 
       const revisions = await revisionRows(pool, deal.dealId);
       // Exactly one successor exists: the chain is linear and never forks.
@@ -180,7 +216,15 @@ describe('SPEC-001 concurrency with real overlapping transactions', () => {
         ),
       );
       const { loserCodes } = classify(results);
-      for (const code of loserCodes) expect(SAFE_LOSER_CODES.has(code)).toBe(true);
+      for (const code of loserCodes) {
+        // §22.4(B): same key + same fingerprint must never be reported as a conflict.
+        expect(code, 'same-key same-fingerprint must never conflict').not.toBe(
+          'IDEMPOTENCY_CONFLICT',
+        );
+        expect(SAME_FINGERPRINT_LOSER_CODES.has(code), `E21 same-key loser code ${code}`).toBe(
+          true,
+        );
+      }
 
       const responses = await responseRows(pool, deal.dealId);
       // Exactly one explicit response and exactly one readiness event.
@@ -210,7 +254,12 @@ describe('SPEC-001 concurrency with real overlapping transactions', () => {
       );
       const { winners, loserCodes } = classify(results);
       expect(winners).toBe(1);
-      for (const code of loserCodes) expect(SAFE_LOSER_CODES.has(code)).toBe(true);
+      // §23.5 — the loser receives a deterministic already-responded/current-state conflict.
+      for (const code of loserCodes)
+        expect(
+          E21_DIFFERENT_KEY_LOSER_CODES.has(code),
+          `E21 different-key loser code ${code}`,
+        ).toBe(true);
 
       const responses = await responseRows(pool, deal.dealId);
       expect(responses.filter((row) => row.responseOrigin === 'EXPLICIT')).toHaveLength(1);
@@ -258,7 +307,8 @@ describe('SPEC-001 concurrency with real overlapping transactions', () => {
         }),
       ]);
       const { winners, loserCodes } = classify(results);
-      for (const code of loserCodes) expect(SAFE_LOSER_CODES.has(code)).toBe(true);
+      for (const code of loserCodes)
+        expect(E39_LOSER_CODES.has(code), `E39 loser code ${code}`).toBe(true);
 
       const row = await dealRow(pool, deal.dealId);
       const revisions = await revisionRows(pool, deal.dealId);

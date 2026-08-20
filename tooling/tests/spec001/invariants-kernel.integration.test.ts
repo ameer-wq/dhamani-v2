@@ -13,6 +13,7 @@ import {
 } from '../../../packages/domain/src/index.ts';
 import { SPEC001_COMMAND_NAMES } from '../../../apps/api/src/spec001/kernel.ts';
 import { uuidV7, publicDealReference } from '../../../apps/api/src/spec001/crypto.ts';
+import { readDeal, readDealByPublicReference } from '../../../apps/api/src/spec001/reads.ts';
 import { createFormalDeal } from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
 import { proposeChanges } from '../../../apps/api/src/spec001/commands/propose-changes.ts';
@@ -25,6 +26,7 @@ import {
   auditEvents,
   backdateInvitation,
   bornDeal,
+  corruptRevisionBytes,
   dealRow,
   errorCodeOf,
   errorOf,
@@ -633,25 +635,44 @@ describe('SPEC-001 kernel invariants', () => {
           responseOrigin: 'EXPLICIT' as const,
         },
       ],
+      currentRevisionIntegrity: 'VERIFIED' as const,
     };
     expect(deriveAgreementReady(base, now)).toBe(true);
 
-    // Each condition independently falsifies readiness.
+    // Each §18 condition independently falsifies readiness.
+    // 1. Deal is terminal.
     expect(
       deriveAgreementReady({ ...base, deal: { ...base.deal, terminationReason: 'REJECTED' } }, now),
     ).toBe(false);
+    // 2. Deal is effectively expired.
     expect(deriveAgreementReady(base, new Date(base.deal.inviteExpiresAt.getTime() + 1))).toBe(
       false,
     );
+    // 3. Both slots are not bound.
     expect(
       deriveAgreementReady(
         { ...base, slots: [base.slots[0]!, { ...base.slots[1]!, principalId: null }] },
         now,
       ),
     ).toBe(false);
+    // 4. Bound Principals are not distinct.
+    expect(
+      deriveAgreementReady(
+        { ...base, slots: [base.slots[0]!, { ...base.slots[1]!, principalId: 'a' }] },
+        now,
+      ),
+    ).toBe(false);
+    // 5. Current revision does not exist.
     expect(
       deriveAgreementReady({ ...base, deal: { ...base.deal, currentRevisionId: 'missing' } }, now),
     ).toBe(false);
+    // 6. Current revision does not PASS INTEGRITY VALIDATION (§18) — both the failed verdict and
+    //    the fail-closed default of a snapshot that never performed the check.
+    expect(deriveAgreementReady({ ...base, currentRevisionIntegrity: 'FAILED' }, now)).toBe(false);
+    expect(deriveAgreementReady({ ...base, currentRevisionIntegrity: 'UNVERIFIED' }, now)).toBe(
+      false,
+    );
+    // 7. A bound Principal has no ACCEPT for the exact current revision.
     expect(deriveAgreementReady({ ...base, responses: [base.responses[0]!] }, now)).toBe(false);
     expect(
       deriveAgreementReady(
@@ -662,13 +683,66 @@ describe('SPEC-001 kernel invariants', () => {
         now,
       ),
     ).toBe(false);
-    // A response to a DIFFERENT revision never confers readiness on the current one.
+    // 8. A response to a DIFFERENT revision never confers readiness on the current one.
     expect(
       deriveAgreementReady(
         { ...base, responses: [base.responses[0]!, { ...base.responses[1]!, revisionId: 'r0' }] },
         now,
       ),
     ).toBe(false);
+
+    // ---- real PostgreSQL: a corrupted current revision must fail the authorized read closed ----
+    const deal = await bornDeal(pool, { title: 'Readiness integrity gate' });
+    await acceptCurrentRevision(pool, ports, {
+      actorPrincipalId: deal.counterpartyId,
+      correlationId: randomUUID(),
+      dealId: deal.dealId,
+      targetRevisionId: deal.revisionId,
+      idempotencyKey: key(),
+    });
+    const healthy = await readDeal(
+      pool,
+      ports,
+      { kind: 'PARTICIPANT', principalId: deal.counterpartyId },
+      deal.dealId,
+    );
+    expect(healthy.agreementReady).toBe(true);
+
+    const before = await dealRow(pool, deal.dealId);
+    await corruptRevisionBytes(
+      pool,
+      `UPDATE "AgreementRevision" SET "integrityFingerprint" = decode(repeat('00',32),'hex')
+        WHERE "id"=$1`,
+      [deal.revisionId],
+    );
+
+    // The read fails closed and cannot report readiness for a revision that fails integrity.
+    expect(
+      await errorCodeOf(() =>
+        readDeal(
+          pool,
+          ports,
+          { kind: 'PARTICIPANT', principalId: deal.counterpartyId },
+          deal.dealId,
+        ),
+      ),
+    ).toBe('REVISION_INTEGRITY_FAILURE');
+    expect(
+      await errorCodeOf(() =>
+        readDealByPublicReference(
+          pool,
+          ports,
+          { kind: 'TRUSTED_SYSTEM', purpose: 'readiness-audit' },
+          deal.publicReference,
+        ),
+      ),
+    ).toBe('REVISION_INTEGRITY_FAILURE');
+
+    // No contractual mutation resulted from the refused reads.
+    const after = await dealRow(pool, deal.dealId);
+    expect(after.version).toBe(before.version);
+    expect(after.terminationReason).toBeNull();
+    expect(await responseRows(pool, deal.dealId)).toHaveLength(2);
   });
 
   it('spec001_client_terms_cannot_author_domain_authority', async () => {
@@ -904,6 +978,7 @@ describe('SPEC-001 kernel invariants', () => {
       slots: [] as never,
       revisions: await revisionRows(pool, deal.dealId),
       responses: [] as never,
+      currentRevisionIntegrity: 'VERIFIED' as const,
     };
     // Credits are derived purely from committed successors in history.
     expect(committedSuccessorCredits(snapshotAfterFailures as never, deal.counterpartyId)).toBe(0);
@@ -937,6 +1012,7 @@ describe('SPEC-001 kernel invariants', () => {
           slots: [] as never,
           revisions: finalRevisions,
           responses: [] as never,
+          currentRevisionIntegrity: 'VERIFIED' as const,
         },
         deal.counterpartyId,
       ),

@@ -49,7 +49,7 @@ function assertAuthorized(scope: ActorScope, snapshot: DealSnapshot): void {
 
 export async function readDeal(
   pool: KernelDatabase,
-  _ports: KernelPorts,
+  ports: KernelPorts,
   scope: ActorScope,
   dealId: string,
 ): Promise<DealView> {
@@ -57,8 +57,14 @@ export async function readDeal(
     const row = await lockDeal(sql, dealId);
     if (!row) throw new Spec001Error('DEAL_NOT_FOUND');
     const commandTime = await captureCommandTime(sql);
-    const snapshot = await loadDealSnapshot(sql, row);
+    const snapshot = await loadDealSnapshot(sql, row, ports);
     assertAuthorized(scope, snapshot);
+    // §18/§11.3 — a read may not report on a Deal whose current revision fails integrity. This
+    // fails closed before any readiness value is produced, and performs no contractual mutation.
+    if (snapshot.currentRevisionIntegrity !== 'VERIFIED')
+      throw new Spec001Error('REVISION_INTEGRITY_FAILURE', {
+        reason: snapshot.currentRevisionIntegrity,
+      });
     return Object.freeze({
       dealId: row.id,
       publicReference: row.publicReference,
@@ -88,6 +94,13 @@ export async function readDealByPublicReference(
     [publicReference],
   );
   const dealId = located.rows[0]?.id;
-  if (!dealId) throw new Spec001Error('DEAL_NOT_FOUND');
+  if (!dealId) {
+    // §28 — the reference lookup lives behind the authorization boundary, and `publicReference`
+    // alone is never authorization. A participant scope therefore receives the same answer for
+    // "no such reference" and "not your Deal", so holding a reference cannot be used as an
+    // existence oracle. A named trusted system scope is authorized to learn the difference.
+    if (scope.kind === 'PARTICIPANT') throw new Spec001Error('NOT_DEAL_PARTICIPANT');
+    throw new Spec001Error('DEAL_NOT_FOUND');
+  }
   return readDeal(pool, ports, scope, dealId);
 }

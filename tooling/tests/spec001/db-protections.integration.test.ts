@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   SPEC001_TABLES,
+  Spec001Error,
   evaluateRuntimeRoleReadiness,
 } from '../../../packages/domain/src/index.ts';
 import {
@@ -9,10 +10,22 @@ import {
 } from '../../../apps/api/src/spec001/readiness.ts';
 import {
   createKernelDatabase,
+  driverFailureOf,
+  isRetryableDatabaseError,
+  mapDatabaseError,
   type KernelDatabase,
 } from '../../../apps/api/src/spec001/database.ts';
 import { uuidV7 } from '../../../apps/api/src/spec001/crypto.ts';
-import { bornDeal, ownerPool, randomUUID, runtimeConnectionString } from './helpers.ts';
+import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
+import { createFormalDeal } from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
+import {
+  bornDeal,
+  ownerPool,
+  ports,
+  randomUUID,
+  runtimeConnectionString,
+  terms,
+} from './helpers.ts';
 
 const owner = ownerPool();
 let runtime: KernelDatabase;
@@ -228,6 +241,32 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
       ),
     ).toMatch(/DealPartySlot_dealType_fkey|DealPartySlot_deal_slotKind_key/);
 
+    // Explicit ONE-slot probe: a Deal committing with exactly one slot must be rejected by the
+    // deferred exactly-two-slots protection (the zero-slot probe follows).
+    const oneSlotDeal = uuidV7();
+    const oneSlotRevision = uuidV7();
+    expect(
+      await ownerAttack(
+        `WITH d AS (
+           INSERT INTO "Deal" ("id","publicReference","dealType","currentRevisionId","sentAt","inviteExpiresAt","version","createdAt")
+           VALUES ($1,$2,'GOODS',$3, now(), now() + interval '168 hours', 1, now())
+         ), r AS (
+           INSERT INTO "AgreementRevision"
+             ("id","dealId","revisionNumber","predecessorRevisionId","createdByPrincipalId","termsSchemaId","termsPayloadCanonicalBytes","integrityPreimageCanonicalBytes","integrityFingerprint","createdAt")
+           VALUES ($3,$1,1,NULL,$4,'dhamani.goods.v1','{}'::bytea,'{}'::bytea,decode(repeat('ab',32),'hex'),now())
+         )
+         INSERT INTO "DealPartySlot"
+           ("id","dealId","dealType","slotKind","role","principalId","pendingInviteId","createdAt","boundAt")
+         VALUES ($5,$1,'GOODS','CREATOR','BUYER',$4,NULL,now(),now())`,
+        [oneSlotDeal, reference(), oneSlotRevision, randomUUID(), uuidV7()],
+      ),
+    ).toMatch(/SPEC001_DEAL_REQUIRES_EXACTLY_TWO_SLOTS/);
+    const oneSlotRows = await owner.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM "Deal" WHERE "id"=$1`,
+      [oneSlotDeal],
+    );
+    expect(oneSlotRows.rows[0]!.count).toBe(0);
+
     // A Deal with fewer than two slots cannot commit.
     const lonelyDeal = uuidV7();
     const lonelyRevision = uuidV7();
@@ -309,70 +348,392 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
   });
 
   it('spec001_e31_birth_failure_injection_matrix', async () => {
-    // Failure injected after each birth stage must leave zero committed truth. The stages are
-    // driven directly so the abort point is exact.
-    const stages = ['deal', 'revision', 'slot1', 'slot2', 'response', 'audit'] as const;
-    for (const stage of stages) {
-      const dealId = uuidV7();
-      const revisionId = uuidV7();
-      const creatorId = randomUUID();
-      const counterpartyId = randomUUID();
-      const client = await owner.connect();
-      try {
-        await client.query('BEGIN');
-        await client.query(
-          `INSERT INTO "Deal" ("id","publicReference","dealType","currentRevisionId","sentAt","inviteExpiresAt","version","createdAt")
-           VALUES ($1,$2,'GOODS',$3, now(), now() + interval '168 hours', 1, now())`,
-          [dealId, reference(), revisionId],
+    // Frozen E31 requires a real failure after EVERY birth stage, including the audit and
+    // idempotency stages, with zero partial committed truth afterwards. The failures are
+    // injected into the real CreateFormalDeal transaction with test-only triggers keyed on a
+    // sentinel public reference, so the production path carries no test hook.
+    const FAULT_STAGES = [
+      'deal',
+      'revision',
+      'slot1',
+      'slot2',
+      'response',
+      'audit',
+      'idempotency',
+    ] as const;
+
+    await owner.query(
+      'CREATE TABLE IF NOT EXISTS spec001_test_birth_fault (marker text primary key, stage text not null)',
+    );
+
+    // Each trigger fires only for the sentinel Deal and only for its declared stage.
+    const install = async (table: string, name: string, body: string) => {
+      await owner.query(`CREATE OR REPLACE FUNCTION ${name}() RETURNS TRIGGER
+          LANGUAGE plpgsql AS $fn$
+          DECLARE target text;
+          BEGIN
+            ${body}
+            RETURN NEW;
+          END; $fn$;`);
+      await owner.query(
+        `CREATE OR REPLACE TRIGGER "${name}_trg" BEFORE INSERT OR UPDATE ON "${table}"
+             FOR EACH ROW EXECUTE FUNCTION ${name}()`,
+      );
+      await owner.query(`ALTER TABLE "${table}" ENABLE ALWAYS TRIGGER "${name}_trg"`);
+    };
+
+    const dealScoped = (stage: string) => `
+        SELECT f.stage INTO target FROM spec001_test_birth_fault f
+          JOIN "Deal" d ON d."publicReference" = f.marker
+         WHERE d."id" = NEW."dealId" AND f.stage = '${stage}';
+        IF target IS NOT NULL THEN
+          RAISE EXCEPTION 'INJECTED_BIRTH_FAILURE_${stage}' USING ERRCODE = 'raise_exception';
+        END IF;`;
+
+    try {
+      await install('AgreementRevision', 'spec001_test_fault_revision', dealScoped('deal'));
+      await install(
+        'DealPartySlot',
+        'spec001_test_fault_slot',
+        `SELECT f.stage INTO target FROM spec001_test_birth_fault f
+             JOIN "Deal" d ON d."publicReference" = f.marker
+            WHERE d."id" = NEW."dealId"
+              AND ((f.stage = 'revision' AND NEW."slotKind" = 'CREATOR')
+                OR (f.stage = 'slot1' AND NEW."slotKind" = 'COUNTERPARTY'));
+           IF target IS NOT NULL THEN
+             RAISE EXCEPTION 'INJECTED_BIRTH_FAILURE_slot' USING ERRCODE = 'raise_exception';
+           END IF;`,
+      );
+      await install('RevisionResponse', 'spec001_test_fault_response', dealScoped('slot2'));
+      await install('DealAgreementAuditEvent', 'spec001_test_fault_audit', dealScoped('response'));
+      await install(
+        'ApplicationIdempotencyRecord',
+        'spec001_test_fault_idempotency',
+        `SELECT f.stage INTO target FROM spec001_test_birth_fault f
+            WHERE f.marker = NEW."idempotencyKey" AND f.stage = 'audit';
+           IF target IS NOT NULL AND NEW."outcomeKind" <> 'PENDING' THEN
+             RAISE EXCEPTION 'INJECTED_BIRTH_FAILURE_audit' USING ERRCODE = 'raise_exception';
+           END IF;`,
+      );
+      // The final stage fails at COMMIT, after every statement has already succeeded.
+      await owner.query(`CREATE OR REPLACE FUNCTION spec001_test_fault_commit() RETURNS TRIGGER
+          LANGUAGE plpgsql AS $fn$
+          DECLARE target text;
+          BEGIN
+            SELECT f.stage INTO target FROM spec001_test_birth_fault f
+             WHERE f.marker = NEW."publicReference" AND f.stage = 'idempotency';
+            IF target IS NOT NULL THEN
+              RAISE EXCEPTION 'INJECTED_BIRTH_FAILURE_commit' USING ERRCODE = 'raise_exception';
+            END IF;
+            RETURN NULL;
+          END; $fn$;`);
+      // A deferred check must be a CONSTRAINT TRIGGER, which has no CREATE OR REPLACE form.
+      await owner
+        .query('DROP TRIGGER IF EXISTS "spec001_test_fault_commit_trg" ON "Deal"')
+        .catch(() => undefined);
+      await owner.query(
+        `CREATE CONSTRAINT TRIGGER "spec001_test_fault_commit_trg" AFTER INSERT ON "Deal"
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+             EXECUTE FUNCTION spec001_test_fault_commit()`,
+      );
+
+      for (const stage of FAULT_STAGES) {
+        const marker = reference();
+        const idempotencyKey = randomUUID();
+        const actorPrincipalId = randomUUID();
+        // The idempotency-stage trigger keys on the caller key rather than the reference.
+        await owner.query('INSERT INTO spec001_test_birth_fault (marker, stage) VALUES ($1,$2)', [
+          stage === 'audit' ? idempotencyKey : marker,
+          stage,
+        ]);
+
+        // A fixed reference generator makes the sentinel deterministic; every other id still
+        // comes from the real production port.
+        const sentinelPorts = { ...ports, newPublicReference: () => marker };
+
+        let failed = false;
+        try {
+          await createFormalDeal(owner, sentinelPorts, {
+            actorPrincipalId,
+            correlationId: randomUUID(),
+            dealType: 'GOODS',
+            creatorRole: 'BUYER',
+            counterpartyTarget: { kind: 'PRINCIPAL', principalId: randomUUID() },
+            termsSchemaId: 'dhamani.goods.v1',
+            rawTerms: terms(`Birth failure ${stage}`),
+            idempotencyKey,
+          });
+        } catch {
+          failed = true;
+        }
+        expect(failed, `stage ${stage} must fail`).toBe(true);
+
+        // ZERO partial committed truth across all six SPEC-001 tables.
+        const residue = await owner.query<{
+          deals: number;
+          revisions: number;
+          slots: number;
+          responses: number;
+          events: number;
+          claims: number;
+        }>(
+          `SELECT
+               (SELECT count(*)::int FROM "Deal" WHERE "publicReference"=$1) AS deals,
+               (SELECT count(*)::int FROM "AgreementRevision" r
+                  JOIN "Deal" d ON d."id"=r."dealId" WHERE d."publicReference"=$1) AS revisions,
+               (SELECT count(*)::int FROM "DealPartySlot" s
+                  JOIN "Deal" d ON d."id"=s."dealId" WHERE d."publicReference"=$1) AS slots,
+               (SELECT count(*)::int FROM "RevisionResponse" p
+                  JOIN "Deal" d ON d."id"=p."dealId" WHERE d."publicReference"=$1) AS responses,
+               (SELECT count(*)::int FROM "DealAgreementAuditEvent" a
+                  JOIN "Deal" d ON d."id"=a."dealId" WHERE d."publicReference"=$1) AS events,
+               (SELECT count(*)::int FROM "ApplicationIdempotencyRecord"
+                  WHERE "idempotencyKey"=$2) AS claims`,
+          [marker, idempotencyKey],
         );
-        if (stage !== 'deal') {
-          await client.query(
-            `INSERT INTO "AgreementRevision"
-               ("id","dealId","revisionNumber","predecessorRevisionId","createdByPrincipalId","termsSchemaId","termsPayloadCanonicalBytes","integrityPreimageCanonicalBytes","integrityFingerprint","createdAt")
-             VALUES ($1,$2,1,NULL,$3,'dhamani.goods.v1','{}'::bytea,'{}'::bytea,decode(repeat('ab',32),'hex'),now())`,
-            [revisionId, dealId, creatorId],
-          );
-        }
-        if (stage !== 'deal' && stage !== 'revision') {
-          await client.query(
-            `INSERT INTO "DealPartySlot" ("id","dealId","dealType","slotKind","role","principalId","pendingInviteId","createdAt","boundAt")
-             VALUES ($1,$2,'GOODS','CREATOR','BUYER',$3,NULL,now(),now())`,
-            [uuidV7(), dealId, creatorId],
-          );
-        }
-        if (stage === 'slot2' || stage === 'response' || stage === 'audit') {
-          await client.query(
-            `INSERT INTO "DealPartySlot" ("id","dealId","dealType","slotKind","role","principalId","pendingInviteId","createdAt","boundAt")
-             VALUES ($1,$2,'GOODS','COUNTERPARTY','SELLER',$3,NULL,now(),now())`,
-            [uuidV7(), dealId, counterpartyId],
-          );
-        }
-        if (stage === 'response' || stage === 'audit') {
-          await client.query(
-            `INSERT INTO "RevisionResponse" ("id","dealId","revisionId","principalId","responseKind","responseOrigin","createdAt")
-             VALUES ($1,$2,$3,$4,'ACCEPT','REVISION_CREATOR_AUTO',now())`,
-            [uuidV7(), dealId, revisionId, creatorId],
-          );
-        }
-        // Inject the failure for this stage.
-        await client.query('ROLLBACK');
-      } finally {
-        client.release();
+        expect(residue.rows[0], `stage ${stage} left partial truth`).toEqual({
+          deals: 0,
+          revisions: 0,
+          slots: 0,
+          responses: 0,
+          events: 0,
+          claims: 0,
+        });
+
+        await owner.query('DELETE FROM spec001_test_birth_fault');
       }
 
-      for (const [table, column] of [
-        ['Deal', 'id'],
-        ['AgreementRevision', 'dealId'],
-        ['DealPartySlot', 'dealId'],
-        ['RevisionResponse', 'dealId'],
-        ['DealAgreementAuditEvent', 'dealId'],
+      // With no fault configured the very same path commits normally, proving the matrix was
+      // failing for the injected reason and not because the path was broken.
+      const healthy = await createFormalDeal(owner, ports, {
+        actorPrincipalId: randomUUID(),
+        correlationId: randomUUID(),
+        dealType: 'GOODS',
+        creatorRole: 'BUYER',
+        counterpartyTarget: { kind: 'PRINCIPAL', principalId: randomUUID() },
+        termsSchemaId: 'dhamani.goods.v1',
+        rawTerms: terms('Birth failure control'),
+        idempotencyKey: randomUUID(),
+      });
+      expect(healthy.replayed).toBe(false);
+    } finally {
+      for (const [table, name] of [
+        ['AgreementRevision', 'spec001_test_fault_revision'],
+        ['DealPartySlot', 'spec001_test_fault_slot'],
+        ['RevisionResponse', 'spec001_test_fault_response'],
+        ['DealAgreementAuditEvent', 'spec001_test_fault_audit'],
+        ['ApplicationIdempotencyRecord', 'spec001_test_fault_idempotency'],
       ] as const) {
-        const rows = await owner.query<{ count: number }>(
-          `SELECT count(*)::int AS count FROM "${table}" WHERE "${column}"=$1`,
-          [dealId],
-        );
-        expect(rows.rows[0]!.count, `${stage} left ${table} rows behind`).toBe(0);
+        await owner
+          .query(`DROP TRIGGER IF EXISTS "${name}_trg" ON "${table}"`)
+          .catch(() => undefined);
+        await owner.query(`DROP FUNCTION IF EXISTS ${name}()`).catch(() => undefined);
       }
+      await owner
+        .query('DROP TRIGGER IF EXISTS "spec001_test_fault_commit_trg" ON "Deal"')
+        .catch(() => undefined);
+      await owner
+        .query('DROP FUNCTION IF EXISTS spec001_test_fault_commit()')
+        .catch(() => undefined);
+      await owner.query('DROP TABLE IF EXISTS spec001_test_birth_fault').catch(() => undefined);
     }
+  }, 300_000);
+  it('spec001_settled_idempotency_outcome_is_immutable', async () => {
+    // The runtime role legitimately holds column-level UPDATE on (outcomeKind, outcome,
+    // commandTime) so it can settle its own claim. Without a DB state machine that same grant
+    // would let it rewrite historical replay truth after commit (§22.5, E42).
+    const deal = await bornDeal(owner, { title: 'Settled outcome immutability' });
+    const acceptKey = randomUUID();
+    const accepted = await acceptCurrentRevision(owner, ports, {
+      actorPrincipalId: deal.counterpartyId,
+      correlationId: randomUUID(),
+      dealId: deal.dealId,
+      targetRevisionId: deal.revisionId,
+      idempotencyKey: acceptKey,
+    });
+
+    const stored = await owner.query<{
+      id: string;
+      outcomeKind: string;
+      outcome: Record<string, unknown>;
+      commandTime: Date;
+    }>(
+      `SELECT "id","outcomeKind","outcome","commandTime" FROM "ApplicationIdempotencyRecord"
+        WHERE "idempotencyKey"=$1`,
+      [acceptKey],
+    );
+    expect(stored.rowCount).toBe(1);
+    const record = stored.rows[0]!;
+    // 1. The legitimate PENDING -> settled transition already worked.
+    expect(record.outcomeKind).toBe('SUCCESS');
+    expect(record.outcome.resultKind).toBe('FIRST_MUTUAL_ACCEPTANCE_REACHED');
+
+    // 2-5. Every post-settlement rewrite attempted as the constrained runtime credential must
+    // fail at the database protection step.
+    const tampering: Array<[string, string, unknown[]]> = [
+      [
+        'rewrite stored outcome json',
+        `UPDATE "ApplicationIdempotencyRecord" SET "outcome"='{"tampered":true}'::jsonb WHERE "id"=$1`,
+        [record.id],
+      ],
+      [
+        'reclassify SUCCESS -> TYPED_ERROR',
+        `UPDATE "ApplicationIdempotencyRecord" SET "outcomeKind"='TYPED_ERROR' WHERE "id"=$1`,
+        [record.id],
+      ],
+      [
+        'reset settlement back to PENDING',
+        `UPDATE "ApplicationIdempotencyRecord" SET "outcomeKind"='PENDING' WHERE "id"=$1`,
+        [record.id],
+      ],
+      [
+        'rewrite the authoritative command time',
+        `UPDATE "ApplicationIdempotencyRecord" SET "commandTime"=now() WHERE "id"=$1`,
+        [record.id],
+      ],
+      [
+        'rewrite kind and outcome together',
+        `UPDATE "ApplicationIdempotencyRecord" SET "outcomeKind"='TYPED_ERROR', "outcome"='{"typedErrorCode":"DEAL_TERMINATED"}'::jsonb WHERE "id"=$1`,
+        [record.id],
+      ],
+    ];
+    for (const [name, statement, values] of tampering) {
+      const failure = await runtimeAttack(statement, values);
+      expect(failure, name).toMatch(
+        /SPEC001_IDEMPOTENCY_OUTCOME_IMMUTABLE|SPEC001_IDEMPOTENCY_COMMAND_TIME_SET_ONCE|permission denied/i,
+      );
+    }
+    // Deleting the historical record outright is equally refused.
+    expect(
+      await runtimeAttack(`DELETE FROM "ApplicationIdempotencyRecord" WHERE "id"=$1`, [record.id]),
+    ).toMatch(/permission denied|SPEC001_APPEND_ONLY_VIOLATION/i);
+
+    // The stored row is byte-for-byte what the original command committed.
+    const after = await owner.query<{
+      outcomeKind: string;
+      outcome: Record<string, unknown>;
+      commandTime: Date;
+    }>(
+      `SELECT "outcomeKind","outcome","commandTime" FROM "ApplicationIdempotencyRecord" WHERE "id"=$1`,
+      [record.id],
+    );
+    expect(after.rows[0]!.outcomeKind).toBe('SUCCESS');
+    expect(after.rows[0]!.outcome).toEqual(record.outcome);
+    expect(after.rows[0]!.commandTime.getTime()).toBe(record.commandTime.getTime());
+
+    // 6. Replay after the attempted tampering still returns the original committed truth.
+    const replay = await acceptCurrentRevision(owner, ports, {
+      actorPrincipalId: deal.counterpartyId,
+      correlationId: randomUUID(),
+      dealId: deal.dealId,
+      targetRevisionId: deal.revisionId,
+      idempotencyKey: acceptKey,
+    });
+    expect(replay.replayed).toBe(true);
+    expect(replay.resultKind).toBe(accepted.resultKind);
+    expect(replay.dealVersion).toBe(accepted.dealVersion);
+    expect(replay.agreementReady).toBe(true);
+
+    // Even the owner cannot rewrite a settled outcome: the guard is a DB state machine, not a
+    // privilege boundary.
+    expect(
+      await ownerAttack(
+        `UPDATE "ApplicationIdempotencyRecord" SET "outcome"='{"tampered":true}'::jsonb WHERE "id"=$1`,
+        [record.id],
+      ),
+    ).toMatch(/SPEC001_IDEMPOTENCY_OUTCOME_IMMUTABLE/);
+  });
+
+  it('spec001_transaction_lifecycle_failures_never_escape_untyped', async () => {
+    // §27 — a raw persistence error must never become the caller contract, and §22.4 classes a
+    // cancelled/contended write as the retryable outcome. `@prisma/adapter-pg` issues the
+    // transaction-lifecycle statements (BEGIN, SET TRANSACTION ISOLATION LEVEL, and the engine's
+    // COMMIT/ROLLBACK) through its own `executeRaw`, so their failures are re-thrown as a bare
+    // `DriverAdapterError` that never passes through the pipeline producing `P2010`.
+    //
+    // This injects a *real* cancellation on that exact path: a test-only deferred constraint
+    // trigger stalls inside COMMIT and a genuinely separate connection cancels the backend while
+    // it is stalled. No production code carries a test hook.
+    await owner.query('CREATE TABLE IF NOT EXISTS spec001_test_commit_stall (id int primary key)');
+    await owner.query(`CREATE OR REPLACE FUNCTION spec001_test_commit_stall_fn() RETURNS TRIGGER
+        LANGUAGE plpgsql AS $fn$ BEGIN PERFORM pg_sleep(5); RETURN NULL; END; $fn$;`);
+    await owner.query(
+      'DROP TRIGGER IF EXISTS spec001_test_commit_stall_trg ON spec001_test_commit_stall',
+    );
+    await owner.query(`CREATE CONSTRAINT TRIGGER spec001_test_commit_stall_trg AFTER INSERT
+        ON spec001_test_commit_stall DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+        EXECUTE FUNCTION spec001_test_commit_stall_fn()`);
+    await owner.query('GRANT INSERT ON spec001_test_commit_stall TO dhamani_runtime');
+
+    const canceller = await owner.connect();
+    let captured: unknown;
+    try {
+      await runtime.transaction(async (sql) => {
+        const backend = await sql.query<{ pid: number }>('SELECT pg_backend_pid()::int AS pid');
+        const pid = backend.rows[0]!.pid;
+        await sql.execute('INSERT INTO spec001_test_commit_stall (id) VALUES (1)');
+        // Fires once the callback returns and the engine is inside COMMIT running the trigger.
+        setTimeout(() => {
+          void canceller.query('SELECT pg_cancel_backend($1)', [pid]).catch(() => undefined);
+        }, 1500);
+      });
+      expect.unreachable('the cancelled COMMIT must not report success');
+    } catch (error) {
+      captured = error;
+    } finally {
+      canceller.release();
+    }
+
+    // The raw failure really is the bare adapter shape: no Prisma `meta`, no top-level SQLSTATE.
+    // Those are precisely the two shapes the decoder already handled, so this proves the new
+    // branch — not an existing one — is what types this failure.
+    const raw = captured as { name?: string; code?: unknown; meta?: unknown; cause?: unknown };
+    expect(raw.name).toBe('DriverAdapterError');
+    expect(raw.meta).toBeUndefined();
+    expect(raw.code).toBeUndefined();
+    expect((raw.cause as { originalCode?: string }).originalCode).toBe('57014');
+
+    expect(driverFailureOf(captured)).toEqual({ sqlState: '57014' });
+    expect(isRetryableDatabaseError(captured)).toBe(true);
+    const mapped = mapDatabaseError(captured);
+    expect(mapped).toBeInstanceOf(Spec001Error);
+    expect(mapped.code).toBe('DEAL_WRITE_RETRYABLE');
+
+    // Nothing was committed by the cancelled transaction.
+    const residue = await owner.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM spec001_test_commit_stall',
+    );
+    expect(residue.rows[0]!.count).toBe(0);
+
+    await owner.query('DROP TABLE IF EXISTS spec001_test_commit_stall CASCADE');
+    await owner.query('DROP FUNCTION IF EXISTS spec001_test_commit_stall_fn()');
+  }, 120_000);
+
+  it('spec001_aborted_transaction_state_is_a_retryable_outcome', async () => {
+    // A pooled connection handed over while still inside an aborted block answers 25P02 to the
+    // next command. Nothing of that command executed, so §22.4 makes it retryable rather than a
+    // domain outcome — and never a raw driver error at the boundary. The 25P02 below is produced
+    // by PostgreSQL itself, not fabricated.
+    let captured: unknown;
+    try {
+      await runtime.prisma.$transaction(
+        async (tx) => {
+          try {
+            await tx.$queryRawUnsafe('SELECT 1 / 0');
+          } catch {
+            // deliberately continue on the now-aborted connection, as a poisoned handover does
+          }
+          await tx.$queryRawUnsafe('SELECT 1');
+        },
+        { isolationLevel: 'ReadCommitted', maxWait: 5000, timeout: 10_000 },
+      );
+      expect.unreachable('a statement on an aborted transaction must not succeed');
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(driverFailureOf(captured)?.sqlState).toBe('25P02');
+    expect(isRetryableDatabaseError(captured)).toBe(true);
+    expect(mapDatabaseError(captured).code).toBe('DEAL_WRITE_RETRYABLE');
   });
 });
