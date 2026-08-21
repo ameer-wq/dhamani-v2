@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { spawn, type ChildProcess } from 'node:child_process';
 import {
   SPEC001_TABLES,
-  Spec001Error,
   evaluateRuntimeRoleReadiness,
 } from '../../../packages/domain/src/index.ts';
 import {
@@ -13,16 +13,21 @@ import {
   driverFailureOf,
   isRetryableDatabaseError,
   mapDatabaseError,
+  Spec001PersistenceFailure,
   type KernelDatabase,
 } from '../../../apps/api/src/spec001/database.ts';
 import { uuidV7 } from '../../../apps/api/src/spec001/crypto.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
 import { createFormalDeal } from '../../../apps/api/src/spec001/commands/create-formal-deal.ts';
+import { proposeChanges } from '../../../apps/api/src/spec001/commands/propose-changes.ts';
 import {
   bornDeal,
+  dealRow,
+  errorCodeOf,
   ownerPool,
   ports,
   randomUUID,
+  requireConnectionString,
   runtimeConnectionString,
   terms,
 } from './helpers.ts';
@@ -31,6 +36,59 @@ const owner = ownerPool();
 let runtime: KernelDatabase;
 
 const APPEND_ONLY_TABLES = ['AgreementRevision', 'RevisionResponse', 'DealAgreementAuditEvent'];
+const READINESS_PORT = 3013;
+
+async function probeReadiness(): Promise<number> {
+  try {
+    return (await fetch(`http://127.0.0.1:${READINESS_PORT}/health/ready`)).status;
+  } catch {
+    return 0;
+  }
+}
+
+async function startRealApiForReadiness(
+  databaseUrl: string,
+  expectedStatus: 200 | 503,
+): Promise<ChildProcess> {
+  const child = spawn(
+    process.execPath,
+    [
+      '--require',
+      './tooling/tests/spec001/node-userinfo-shim.cjs',
+      '--import',
+      'tsx',
+      'apps/api/src/main.ts',
+    ],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DHAMANI_RUNTIME_MODE: 'test',
+        DATABASE_URL: databaseUrl,
+        TSX_TSCONFIG_PATH: 'apps/api/tsconfig.json',
+        DHAMANI_PRIVATE_SENTINEL: 'spec001-real-readiness-sentinel',
+        PORT: String(READINESS_PORT),
+      },
+      stdio: 'ignore',
+    },
+  );
+  if (!child.pid) throw new Error('real application readiness process failed to start');
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if ((await probeReadiness()) === expectedStatus) return child;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`real application readiness did not reach HTTP ${expectedStatus}`);
+}
+
+async function stopRealApi(child: ChildProcess): Promise<void> {
+  child.kill('SIGTERM');
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if ((await probeReadiness()) === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  child.kill('SIGKILL');
+  throw new Error('real application readiness process did not stop');
+}
 
 beforeAll(async () => {
   // The runtime role is created NOLOGIN by the migration; evidence needs a real login for it.
@@ -118,6 +176,35 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
     });
     expect(blindVerdict.healthy).toBe(false);
     expect(blindVerdict.failures).toHaveLength(SPEC001_TABLES.length);
+
+    // Exercise the actual service entry point and /health/ready dependency, not a mocked verdict:
+    // the owner credential is reachable but unhealthy, while the constrained credential is ready.
+    let service = await startRealApiForReadiness(requireConnectionString(), 503);
+    try {
+      expect(await probeReadiness()).toBe(503);
+    } finally {
+      await stopRealApi(service);
+    }
+    service = await startRealApiForReadiness(runtimeConnectionString(), 200);
+    try {
+      expect(await probeReadiness()).toBe(200);
+    } finally {
+      await stopRealApi(service);
+    }
+
+    // A reachable, safe credential is not enough: the production readiness route must also
+    // fail closed when a fresh connection to that credential's PostgreSQL endpoint cannot be
+    // established. Port 1 is deliberately unreachable; this still exercises the real app,
+    // controller, readiness evaluator, Prisma adapter, and PostgreSQL driver without a mock.
+    const unavailableRuntimeUrl = new URL(runtimeConnectionString());
+    unavailableRuntimeUrl.hostname = '127.0.0.1';
+    unavailableRuntimeUrl.port = '1';
+    service = await startRealApiForReadiness(unavailableRuntimeUrl.toString(), 503);
+    try {
+      expect(await probeReadiness()).toBe(503);
+    } finally {
+      await stopRealApi(service);
+    }
   });
 
   it('spec001_e28_append_only_runtime_role_bypass_attacks', async () => {
@@ -225,6 +312,35 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
         'ALTER TABLE "DealPartySlot" DISABLE TRIGGER "DealPartySlot_update_guard"',
       ),
     ).toMatch(/must be owner|permission denied/i);
+    const identityAfterFailedDisable = await owner.query<{ principalId: string }>(
+      `SELECT "principalId" AS "principalId" FROM "DealPartySlot"
+        WHERE "dealId"=$1 AND "slotKind"='CREATOR'`,
+      [deal.dealId],
+    );
+    expect(identityAfterFailedDisable.rows[0]!.principalId).toBe(deal.creatorId);
+
+    // Same Principal attack in the named E29 identity: start from a legitimate pending slot so
+    // the intended same-Principal UNIQUE constraint — not the immutable replacement trigger — is
+    // the rule that rejects the attempted bind.
+    const pendingInviteId = randomUUID();
+    const pendingCreator = randomUUID();
+    const pending = await createFormalDeal(owner, ports, {
+      actorPrincipalId: pendingCreator,
+      correlationId: randomUUID(),
+      dealType: 'GOODS',
+      creatorRole: 'BUYER',
+      counterpartyTarget: { kind: 'PENDING_INVITE', pendingInviteId },
+      termsSchemaId: 'dhamani.goods.v1',
+      rawTerms: terms('E29 same principal'),
+      idempotencyKey: randomUUID(),
+    });
+    expect(
+      await ownerAttack(
+        `UPDATE "DealPartySlot" SET "principalId"=$1,"boundAt"=clock_timestamp()
+          WHERE "dealId"=$2 AND "slotKind"='COUNTERPARTY'`,
+        [pendingCreator, pending.dealId],
+      ),
+    ).toMatch(/DealPartySlot_deal_principal_key/);
 
     // Role/type drift is impossible.
     expect(
@@ -232,14 +348,71 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
         deal.dealId,
       ]),
     ).toMatch(/SPEC001_SLOT_IMMUTABLE/);
+    // Construct a fresh birth-shaped transaction whose only malformed row is the role/type
+    // triple. This cannot pass accidentally because of a duplicate slot or parent FK.
+    const mismatchDeal = uuidV7();
+    const mismatchRevision = uuidV7();
     expect(
       await ownerAttack(
-        `INSERT INTO "DealPartySlot"
+        `WITH d AS (
+           INSERT INTO "Deal" ("id","publicReference","dealType","currentRevisionId","sentAt","inviteExpiresAt","version","createdAt")
+           VALUES ($1,$2,'GOODS',$3,now(),now()+interval '168 hours',1,now())
+         ), r AS (
+           INSERT INTO "AgreementRevision"
+             ("id","dealId","revisionNumber","predecessorRevisionId","createdByPrincipalId","termsSchemaId","termsPayloadCanonicalBytes","integrityPreimageCanonicalBytes","integrityFingerprint","createdAt")
+           VALUES ($3,$1,1,NULL,$4,'dhamani.goods.v1','{}'::bytea,'{}'::bytea,decode(repeat('ab',32),'hex'),now())
+         )
+         INSERT INTO "DealPartySlot"
            ("id","dealId","dealType","slotKind","role","principalId","pendingInviteId","createdAt","boundAt")
-         VALUES ($1,$2,'SERVICES','COUNTERPARTY','CLIENT',$3,NULL,now(),now())`,
-        [uuidV7(), deal.dealId, randomUUID()],
+         VALUES ($5,$1,'GOODS','CREATOR','BUYER',$4,NULL,now(),now()),
+                ($6,$1,'GOODS','COUNTERPARTY','CLIENT',$7,NULL,now(),now())`,
+        [
+          mismatchDeal,
+          reference(),
+          mismatchRevision,
+          randomUUID(),
+          uuidV7(),
+          uuidV7(),
+          randomUUID(),
+        ],
       ),
-    ).toMatch(/DealPartySlot_dealType_fkey|DealPartySlot_deal_slotKind_key/);
+    ).toMatch(/DealPartySlot_role_triple_check/);
+
+    // Every post-birth slot identity/role/type drift is rejected by the dedicated slot guard.
+    for (const [field, statement] of [
+      ['dealType', `UPDATE "DealPartySlot" SET "dealType"='SERVICES' WHERE "dealId"=$1`],
+      [
+        'slotKind',
+        `UPDATE "DealPartySlot" SET "slotKind"='COUNTERPARTY' WHERE "dealId"=$1 AND "slotKind"='CREATOR'`,
+      ],
+      [
+        'role',
+        `UPDATE "DealPartySlot" SET "role"='SELLER' WHERE "dealId"=$1 AND "slotKind"='CREATOR'`,
+      ],
+    ] as const) {
+      expect(await ownerAttack(statement, [deal.dealId]), field).toMatch(/SPEC001_SLOT_IMMUTABLE/);
+    }
+
+    // A COUNTERPARTY with no Principal and no opaque pendingInviteId is not a committed state.
+    const invalidStateDeal = uuidV7();
+    const invalidStateRevision = uuidV7();
+    expect(
+      await ownerAttack(
+        `WITH d AS (
+           INSERT INTO "Deal" ("id","publicReference","dealType","currentRevisionId","sentAt","inviteExpiresAt","version","createdAt")
+           VALUES ($1,$2,'GOODS',$3,now(),now()+interval '168 hours',1,now())
+         ), r AS (
+           INSERT INTO "AgreementRevision"
+             ("id","dealId","revisionNumber","predecessorRevisionId","createdByPrincipalId","termsSchemaId","termsPayloadCanonicalBytes","integrityPreimageCanonicalBytes","integrityFingerprint","createdAt")
+           VALUES ($3,$1,1,NULL,$4,'dhamani.goods.v1','{}'::bytea,'{}'::bytea,decode(repeat('ab',32),'hex'),now())
+         )
+         INSERT INTO "DealPartySlot"
+           ("id","dealId","dealType","slotKind","role","principalId","pendingInviteId","createdAt","boundAt")
+         VALUES ($5,$1,'GOODS','CREATOR','BUYER',$4,NULL,now(),now()),
+                ($6,$1,'GOODS','COUNTERPARTY','SELLER',NULL,NULL,now(),NULL)`,
+        [invalidStateDeal, reference(), invalidStateRevision, randomUUID(), uuidV7(), uuidV7()],
+      ),
+    ).toMatch(/DealPartySlot_counterparty_state_check/);
 
     // Explicit ONE-slot probe: a Deal committing with exactly one slot must be rejected by the
     // deferred exactly-two-slots protection (the zero-slot probe follows).
@@ -318,6 +491,32 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
     const dealA = await bornDeal(owner);
     const dealB = await bornDeal(owner);
 
+    // Cross-Deal caller target and successor base fail through the real application command path.
+    expect(
+      await errorCodeOf(() =>
+        acceptCurrentRevision(owner, ports, {
+          actorPrincipalId: dealB.counterpartyId,
+          correlationId: randomUUID(),
+          dealId: dealB.dealId,
+          targetRevisionId: dealA.revisionId,
+          idempotencyKey: randomUUID(),
+        }),
+      ),
+    ).toBe('REVISION_NOT_FOUND');
+    expect(
+      await errorCodeOf(() =>
+        proposeChanges(owner, ports, {
+          actorPrincipalId: dealB.counterpartyId,
+          correlationId: randomUUID(),
+          dealId: dealB.dealId,
+          baseRevisionId: dealA.revisionId,
+          termsSchemaId: 'dhamani.goods.v1',
+          rawTerms: terms('E26 cross Deal base', { attempt: true }),
+          idempotencyKey: randomUUID(),
+        }),
+      ),
+    ).toBe('REVISION_NOT_FOUND');
+
     // A response cannot reference another Deal's revision.
     expect(
       await ownerAttack(
@@ -345,6 +544,18 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
         [uuidV7(), dealB.dealId, dealA.revisionId, dealB.counterpartyId],
       ),
     ).toMatch(/AgreementRevision_predecessor_same_deal_fkey/);
+
+    // Deal.currentRevisionId cannot be redirected to another Deal's revision.
+    expect(
+      await ownerAttack(
+        `UPDATE "Deal" SET "version"="version"+1,"currentRevisionId"=$1 WHERE "id"=$2`,
+        [dealA.revisionId, dealB.dealId],
+      ),
+    ).toMatch(/Deal_currentRevision_same_deal_fkey/);
+
+    // All four abuse surfaces rolled back completely.
+    expect((await dealRow(owner, dealA.dealId)).version).toBe(1);
+    expect((await dealRow(owner, dealB.dealId)).version).toBe(1);
   });
 
   it('spec001_e31_birth_failure_injection_matrix', async () => {
@@ -645,16 +856,21 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
   });
 
   it('spec001_transaction_lifecycle_failures_never_escape_untyped', async () => {
-    // §27 — a raw persistence error must never become the caller contract, and §22.4 classes a
-    // cancelled/contended write as the retryable outcome. `@prisma/adapter-pg` issues the
+    // §27 — a raw persistence error must never become the caller contract. A user/admin
+    // cancellation is not the Frozen-authorized lock/transaction-timeout category and therefore
+    // must not be silently widened to DEAL_WRITE_RETRYABLE. `@prisma/adapter-pg` issues the
     // transaction-lifecycle statements (BEGIN, SET TRANSACTION ISOLATION LEVEL, and the engine's
-    // COMMIT/ROLLBACK) through its own `executeRaw`, so their failures are re-thrown as a bare
-    // `DriverAdapterError` that never passes through the pipeline producing `P2010`.
+    // COMMIT/ROLLBACK) through its own `executeRaw`. Depending on the precise lifecycle race,
+    // Prisma can expose that failure as either its `P2010` wrapper or a bare `DriverAdapterError`;
+    // both shapes must reach the same typed application boundary.
     //
     // This injects a *real* cancellation on that exact path: a test-only deferred constraint
     // trigger stalls inside COMMIT and a genuinely separate connection cancels the backend while
     // it is stalled. No production code carries a test hook.
     await owner.query('CREATE TABLE IF NOT EXISTS spec001_test_commit_stall (id int primary key)');
+    // A prior interrupted evidence run may have stopped before this test's normal teardown.
+    // Re-establish the fixture precondition explicitly so reruns still exercise COMMIT cancellation.
+    await owner.query('TRUNCATE spec001_test_commit_stall');
     await owner.query(`CREATE OR REPLACE FUNCTION spec001_test_commit_stall_fn() RETURNS TRIGGER
         LANGUAGE plpgsql AS $fn$ BEGIN PERFORM pg_sleep(5); RETURN NULL; END; $fn$;`);
     await owner.query(
@@ -684,20 +900,17 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
       canceller.release();
     }
 
-    // The raw failure really is the bare adapter shape: no Prisma `meta`, no top-level SQLSTATE.
-    // Those are precisely the two shapes the decoder already handled, so this proves the new
-    // branch — not an existing one — is what types this failure.
-    const raw = captured as { name?: string; code?: unknown; meta?: unknown; cause?: unknown };
-    expect(raw.name).toBe('DriverAdapterError');
-    expect(raw.meta).toBeUndefined();
-    expect(raw.code).toBeUndefined();
-    expect((raw.cause as { originalCode?: string }).originalCode).toBe('57014');
-
-    expect(driverFailureOf(captured)).toEqual({ sqlState: '57014' });
-    expect(isRetryableDatabaseError(captured)).toBe(true);
+    // The wrapper class is an adapter implementation detail and may differ with COMMIT timing.
+    // The contract proof is that the real PostgreSQL SQLSTATE is recovered from either shape,
+    // is not widened to retryable, and cannot escape the clean internal-failure boundary.
+    expect(captured).toBeDefined();
+    expect(driverFailureOf(captured)?.sqlState).toBe('57014');
+    expect(isRetryableDatabaseError(captured)).toBe(false);
     const mapped = mapDatabaseError(captured);
-    expect(mapped).toBeInstanceOf(Spec001Error);
-    expect(mapped.code).toBe('DEAL_WRITE_RETRYABLE');
+    expect(mapped).toBeInstanceOf(Spec001PersistenceFailure);
+    expect(mapped).not.toBe(captured);
+    expect(mapped.message).toBe('SPEC001_INTERNAL_PERSISTENCE_FAILURE');
+    expect(mapped.cause).toBe(captured);
 
     // Nothing was committed by the cancelled transaction.
     const residue = await owner.query<{ count: number }>(
@@ -709,11 +922,11 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
     await owner.query('DROP FUNCTION IF EXISTS spec001_test_commit_stall_fn()');
   }, 120_000);
 
-  it('spec001_aborted_transaction_state_is_a_retryable_outcome', async () => {
+  it('spec001_aborted_transaction_state_is_contained_not_retryable', async () => {
     // A pooled connection handed over while still inside an aborted block answers 25P02 to the
-    // next command. Nothing of that command executed, so §22.4 makes it retryable rather than a
-    // domain outcome — and never a raw driver error at the boundary. The 25P02 below is produced
-    // by PostgreSQL itself, not fabricated.
+    // next command. 25P02 does not identify a Frozen-authorized timeout/deadlock/contention class,
+    // so it is contained without acquiring DEAL_WRITE_RETRYABLE semantics. The 25P02 below is
+    // produced by PostgreSQL itself, not fabricated.
     let captured: unknown;
     try {
       await runtime.prisma.$transaction(
@@ -733,7 +946,10 @@ describe('SPEC-001 direct-SQL protections as the real runtime role', () => {
     }
 
     expect(driverFailureOf(captured)?.sqlState).toBe('25P02');
-    expect(isRetryableDatabaseError(captured)).toBe(true);
-    expect(mapDatabaseError(captured).code).toBe('DEAL_WRITE_RETRYABLE');
+    expect(isRetryableDatabaseError(captured)).toBe(false);
+    const boundary = mapDatabaseError(captured);
+    expect(boundary).toBeInstanceOf(Spec001PersistenceFailure);
+    expect(boundary).not.toBe(captured);
+    expect(boundary.cause).toBe(captured);
   });
 });

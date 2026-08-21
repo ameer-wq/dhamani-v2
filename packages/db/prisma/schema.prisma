@@ -16,6 +16,7 @@ datasource db {
 //   - Deal(id, currentRevisionId) -> AgreementRevision(dealId, id) DEFERRABLE INITIALLY DEFERRED
 //   - append-only UPDATE/DELETE/TRUNCATE triggers on the contractual-history tables
 //   - the deferred exactly-two-complementary-slots constraint trigger
+//   - the exact pending-or-bound COUNTERPARTY state CHECK
 //   - column-level runtime GRANTs and least-privilege role separation
 //
 // Authoritative lifecycle timestamps intentionally carry no @default(now()) and no @updatedAt:

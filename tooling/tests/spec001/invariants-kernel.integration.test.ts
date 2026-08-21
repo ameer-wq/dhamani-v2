@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   DEAL_TYPES,
   MAX_SUCCESSOR_CREDITS_PER_PARTICIPANT,
@@ -37,6 +38,7 @@ import {
   revisionRows,
   terms,
 } from './helpers.ts';
+import { assertBirthFailureMatrix } from './birth-failure-matrix.ts';
 
 const pool = ownerPool();
 
@@ -149,15 +151,27 @@ describe('SPEC-001 kernel invariants', () => {
 
   it('spec001_entity_ids_are_server_uuidv7_only', async () => {
     const deal = await bornDeal(pool);
-    const ids = await pool.query<{ id: string }>(
-      `SELECT "id" FROM "Deal" WHERE "id"=$1
-       UNION ALL SELECT "id" FROM "AgreementRevision" WHERE "dealId"=$1
-       UNION ALL SELECT "id" FROM "DealPartySlot" WHERE "dealId"=$1
-       UNION ALL SELECT "id" FROM "RevisionResponse" WHERE "dealId"=$1
-       UNION ALL SELECT "id" FROM "DealAgreementAuditEvent" WHERE "dealId"=$1`,
+    const ids = await pool.query<{ family: string; id: string }>(
+      `SELECT 'Deal' AS family, "id" FROM "Deal" WHERE "id"=$1
+       UNION ALL SELECT 'AgreementRevision', "id" FROM "AgreementRevision" WHERE "dealId"=$1
+       UNION ALL SELECT 'DealPartySlot', "id" FROM "DealPartySlot" WHERE "dealId"=$1
+       UNION ALL SELECT 'RevisionResponse', "id" FROM "RevisionResponse" WHERE "dealId"=$1
+       UNION ALL SELECT 'DealAgreementAuditEvent', "id" FROM "DealAgreementAuditEvent" WHERE "dealId"=$1
+       UNION ALL SELECT 'ApplicationIdempotencyRecord', "id"
+         FROM "ApplicationIdempotencyRecord" WHERE "outcome"->>'dealId'=$1::text`,
       [deal.dealId],
     );
-    expect(ids.rowCount).toBeGreaterThanOrEqual(7);
+    expect(new Set(ids.rows.map((row) => row.family))).toEqual(
+      new Set([
+        'Deal',
+        'DealPartySlot',
+        'AgreementRevision',
+        'RevisionResponse',
+        'DealAgreementAuditEvent',
+        'ApplicationIdempotencyRecord',
+      ]),
+    );
+    expect(ids.rowCount).toBeGreaterThanOrEqual(8);
     for (const row of ids.rows) {
       // Version nibble 7 and RFC 4122 variant bits.
       expect(row.id[14], `version nibble of ${row.id}`).toBe('7');
@@ -177,6 +191,36 @@ describe('SPEC-001 kernel invariants', () => {
                              'DealAgreementAuditEvent','ApplicationIdempotencyRecord')`,
     );
     expect(defaults.rows).toEqual([]);
+
+    // Review the actual exported command input contracts. Deal/revision IDs that identify an
+    // existing target/base are allowed; no field can supply the ID of a newly minted Deal, slot,
+    // revision, response, audit event or idempotency record (§6.1).
+    const commandSources = [
+      'accept-current-revision.ts',
+      'bind-counterparty-principal.ts',
+      'create-formal-deal.ts',
+      'propose-changes.ts',
+      'reject-current-revision.ts',
+      'withdraw.ts',
+    ].map((file) =>
+      readFileSync(
+        new URL(`../../../apps/api/src/spec001/commands/${file}`, import.meta.url),
+        'utf8',
+      ),
+    );
+    const inputContracts = commandSources.flatMap(
+      (source) => source.match(/export type \w+Input = Readonly<\{[\s\S]*?\n\}>;/g) ?? [],
+    );
+    // Six declarations cover seven keyed commands because both withdrawal commands share the
+    // same exact input structure in withdraw.ts.
+    expect(inputContracts).toHaveLength(6);
+    const forbiddenMintedIdField =
+      /^\s*(?:id|publicReference|currentRevisionId|revisionId|dealPartySlotId|agreementRevisionId|revisionResponseId|auditEventId|idempotencyRecordId)\??\s*:/m;
+    for (const contract of inputContracts) expect(contract).not.toMatch(forbiddenMintedIdField);
+    const createInput = inputContracts.find((contract) =>
+      contract.includes('CreateFormalDealInput'),
+    )!;
+    expect(createInput).not.toMatch(/^\s*dealId\??\s*:/m);
   });
 
   it('spec001_public_reference_unique_stable_and_collision_safe', async () => {
@@ -188,14 +232,22 @@ describe('SPEC-001 kernel invariants', () => {
     for (const forbidden of ['I', 'L', 'O', 'U'])
       expect(existing.publicReference.slice(3)).not.toContain(forbidden);
 
-    // Injected generator forces real collisions, then yields a fresh reference: the whole birth
-    // transaction is retried and one Deal is committed.
+    // Initial collision plus nine more collisions, then success on collision retry #10. This is
+    // eleven total attempts and proves the literal boundary rather than a merely small sample.
     let attempts = 0;
+    // §5.3 also requires the pre-generated Deal/R1 ids of a rolled-back attempt to be regenerated
+    // for the next one, so a retry can never reuse identity from the aborted transaction.
+    const mintedIds: string[] = [];
     const collideThenSucceed = {
       ...ports,
+      newUuidV7: (): string => {
+        const minted = ports.newUuidV7();
+        mintedIds.push(minted);
+        return minted;
+      },
       newPublicReference: (): string => {
         attempts += 1;
-        return attempts <= 3 ? existing.publicReference : publicDealReference();
+        return attempts <= 10 ? existing.publicReference : publicDealReference();
       },
     };
     const recovered = await createFormalDeal(pool, collideThenSucceed, {
@@ -208,12 +260,25 @@ describe('SPEC-001 kernel invariants', () => {
       rawTerms: terms('Collision recovery'),
       idempotencyKey: key(),
     });
-    expect(attempts).toBe(4);
+    expect(attempts).toBe(11);
     expect(recovered.publicReference).not.toBe(existing.publicReference);
+    // Every attempt minted its own ids and none was reused across the rolled-back transactions.
+    expect(new Set(mintedIds).size).toBe(mintedIds.length);
+    // Each attempt mints at least the idempotency record id plus Deal and R1 ids.
+    expect(mintedIds.length).toBeGreaterThanOrEqual(attempts * 3);
+    expect(mintedIds).toContain(recovered.dealId);
+    expect(mintedIds).toContain(recovered.currentRevisionId);
 
     // Deterministic exhaustion: a permanently colliding generator fails typed after the bounded
     // retries and commits no Formal Deal and no idempotency success.
-    const alwaysCollide = { ...ports, newPublicReference: (): string => existing.publicReference };
+    let exhaustionAttempts = 0;
+    const alwaysCollide = {
+      ...ports,
+      newPublicReference: (): string => {
+        exhaustionAttempts += 1;
+        return existing.publicReference;
+      },
+    };
     const exhaustionKey = key();
     const actorPrincipalId = randomUUID();
     expect(
@@ -230,6 +295,7 @@ describe('SPEC-001 kernel invariants', () => {
         }),
       ),
     ).toBe('DEAL_REFERENCE_GENERATION_FAILED');
+    expect(exhaustionAttempts).toBe(11);
     const references = await pool.query<{ count: number }>(
       `SELECT count(*)::int AS count FROM "Deal" WHERE "publicReference"=$1`,
       [existing.publicReference],
@@ -299,45 +365,11 @@ describe('SPEC-001 kernel invariants', () => {
   });
 
   it('spec001_deal_birth_is_all_or_nothing', async () => {
-    // A birth that fails validation after the strict terms checks commits nothing at all.
-    const actorPrincipalId = randomUUID();
-    const idempotencyKey = key();
-    expect(
-      await errorCodeOf(() =>
-        createFormalDeal(pool, ports, {
-          actorPrincipalId,
-          correlationId: randomUUID(),
-          dealType: 'GOODS',
-          creatorRole: 'CLIENT', // illegal role for GOODS
-          counterpartyTarget: { kind: 'PRINCIPAL', principalId: randomUUID() },
-          termsSchemaId: 'dhamani.goods.v1',
-          rawTerms: terms('Half born'),
-          idempotencyKey,
-        }),
-      ),
-    ).toBe('INVALID_DEAL_ROLE_PAIR');
-
-    // The failed attempt released its idempotency claim: no half-born record survives.
-    const claims = await pool.query<{ count: number }>(
-      `SELECT count(*)::int AS count FROM "ApplicationIdempotencyRecord"
-        WHERE "scope"=$1 AND "idempotencyKey"=$2`,
-      [`PRINCIPAL:${actorPrincipalId}`, idempotencyKey],
-    );
-    expect(claims.rows[0]!.count).toBe(0);
-
-    // A corrected retry under the SAME key may then execute normally (§22.6).
-    const corrected = await createFormalDeal(pool, ports, {
-      actorPrincipalId,
-      correlationId: randomUUID(),
-      dealType: 'GOODS',
-      creatorRole: 'BUYER',
-      counterpartyTarget: { kind: 'PRINCIPAL', principalId: randomUUID() },
-      termsSchemaId: 'dhamani.goods.v1',
-      rawTerms: terms('Half born'),
-      idempotencyKey,
-    });
-    expect(corrected.replayed).toBe(false);
-  });
+    // The named INV-001-005 identity itself executes failures after Deal, each slot, R1,
+    // creator auto-ACCEPT, audit and idempotency settlement. E31 separately invokes an equivalent
+    // matrix; this identity is no longer a name-only mapping to that stronger test.
+    await assertBirthFailureMatrix(pool);
+  }, 300_000);
 
   it('spec001_formal_identity_fields_cannot_be_mutated', async () => {
     const deal = await bornDeal(pool);
@@ -923,22 +955,64 @@ describe('SPEC-001 kernel invariants', () => {
   it('spec001_modification_credits_are_history_derived_and_bounded', async () => {
     expect(MAX_SUCCESSOR_CREDITS_PER_PARTICIPANT).toBe(2);
     const deal = await bornDeal(pool, { title: 'Credit derivation' });
+    const creditCount = async (principalId: string): Promise<number> => {
+      const rows = await revisionRows(pool, deal.dealId);
+      return rows.filter(
+        (revision) => revision.revisionNumber > 1 && revision.createdByPrincipalId === principalId,
+      ).length;
+    };
+    const expectCredits = async (creator: number, counterparty: number) => {
+      expect(await creditCount(deal.creatorId), 'creator committed successor history').toBe(
+        creator,
+      );
+      expect(
+        await creditCount(deal.counterpartyId),
+        'counterparty committed successor history',
+      ).toBe(counterparty);
+    };
 
-    // Non-consuming failure classes, each proven to leave credits untouched.
-    const nonConsuming: Array<() => Promise<unknown>> = [
-      // turn violation
-      () =>
+    // R1 consumes no credit. An authorized read/editor open is non-mutating.
+    await expectCredits(0, 0);
+    await readDeal(
+      pool,
+      ports,
+      { kind: 'PARTICIPANT', principalId: deal.counterpartyId },
+      deal.dealId,
+    );
+    await expectCredits(0, 0); // editor open
+
+    expect(
+      await errorCodeOf(() =>
         proposeChanges(pool, ports, {
-          actorPrincipalId: deal.creatorId,
+          actorPrincipalId: deal.counterpartyId,
           correlationId: randomUUID(),
           dealId: deal.dealId,
           baseRevisionId: deal.revisionId,
           termsSchemaId: 'dhamani.goods.v1',
-          rawTerms: terms('Credit derivation', { turn: 'violation' }),
+          rawTerms: terms('x'),
           idempotencyKey: key(),
         }),
-      // unchanged terms
-      () =>
+      ),
+    ).toBe('VALIDATION_ERROR');
+    await expectCredits(0, 0); // validation failure
+
+    expect(
+      await errorCodeOf(() =>
+        proposeChanges(pool, ports, {
+          actorPrincipalId: deal.counterpartyId,
+          correlationId: randomUUID(),
+          dealId: deal.dealId,
+          baseRevisionId: deal.revisionId,
+          termsSchemaId: 'dhamani.goods.v1',
+          rawTerms: new TextEncoder().encode('{"common":{"title":"abc"},"common":{}}'),
+          idempotencyKey: key(),
+        }),
+      ),
+    ).toBe('TERMS_JSON_DUPLICATE_KEY');
+    await expectCredits(0, 0); // raw JSON failure
+
+    expect(
+      await errorCodeOf(() =>
         proposeChanges(pool, ports, {
           actorPrincipalId: deal.counterpartyId,
           correlationId: randomUUID(),
@@ -948,88 +1022,191 @@ describe('SPEC-001 kernel invariants', () => {
           rawTerms: terms('Credit derivation'),
           idempotencyKey: key(),
         }),
-      // raw JSON failure
-      () =>
+      ),
+    ).toBe('REVISION_TERMS_UNCHANGED');
+    await expectCredits(0, 0); // unchanged terms
+
+    expect(
+      await errorCodeOf(() =>
         proposeChanges(pool, ports, {
-          actorPrincipalId: deal.counterpartyId,
+          actorPrincipalId: deal.creatorId,
           correlationId: randomUUID(),
           dealId: deal.dealId,
           baseRevisionId: deal.revisionId,
           termsSchemaId: 'dhamani.goods.v1',
-          rawTerms: new TextEncoder().encode('{"a":1,"a":2}'),
+          rawTerms: terms('Credit derivation', { turnViolation: true }),
           idempotencyKey: key(),
         }),
-      // stale base revision
-      () =>
-        proposeChanges(pool, ports, {
+      ),
+    ).toBe('ACTOR_MUST_WAIT_FOR_COUNTERPARTY');
+    await expectCredits(0, 0); // turn violation
+
+    // Network/transport loss before commit is represented by a real audit-write failure inside
+    // the production transaction. Revision, auto-response, audit and idempotency all roll back.
+    const failedCorrelation = randomUUID();
+    await pool.query(`CREATE OR REPLACE FUNCTION spec001_r4_credit_network_failure()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $fn$ BEGIN
+          IF NEW."correlationId"::text = '${failedCorrelation}' THEN
+            RAISE EXCEPTION 'INJECTED_PRECOMMIT_NETWORK_FAILURE';
+          END IF;
+          RETURN NEW;
+        END; $fn$;`);
+    await pool.query(`CREATE TRIGGER "DealAgreementAuditEvent_r4_credit_failure"
+        BEFORE INSERT ON "DealAgreementAuditEvent" FOR EACH ROW
+        EXECUTE FUNCTION spec001_r4_credit_network_failure()`);
+    try {
+      let failed = false;
+      try {
+        await proposeChanges(pool, ports, {
           actorPrincipalId: deal.counterpartyId,
+          correlationId: failedCorrelation,
+          dealId: deal.dealId,
+          baseRevisionId: deal.revisionId,
+          termsSchemaId: 'dhamani.goods.v1',
+          rawTerms: terms('Credit derivation', { precommitNetworkLoss: true }),
+          idempotencyKey: key(),
+        });
+      } catch {
+        failed = true;
+      }
+      expect(failed).toBe(true);
+      await expectCredits(0, 0);
+    } finally {
+      await pool.query(
+        'DROP TRIGGER IF EXISTS "DealAgreementAuditEvent_r4_credit_failure" ON "DealAgreementAuditEvent"',
+      );
+      await pool.query('DROP FUNCTION IF EXISTS spec001_r4_credit_network_failure()');
+    }
+
+    // One committed successor consumes one counterparty credit; an exact idempotent replay does
+    // not consume a second one or append a duplicate revision.
+    const counterpartyKey = key();
+    const r2 = await proposeChanges(pool, ports, {
+      actorPrincipalId: deal.counterpartyId,
+      correlationId: randomUUID(),
+      dealId: deal.dealId,
+      baseRevisionId: deal.revisionId,
+      termsSchemaId: 'dhamani.goods.v1',
+      rawTerms: terms('Credit derivation', { committed: 'counterparty-1' }),
+      idempotencyKey: counterpartyKey,
+    });
+    const replay = await proposeChanges(pool, ports, {
+      actorPrincipalId: deal.counterpartyId,
+      correlationId: randomUUID(),
+      dealId: deal.dealId,
+      baseRevisionId: deal.revisionId,
+      termsSchemaId: 'dhamani.goods.v1',
+      rawTerms: terms('Credit derivation', { committed: 'counterparty-1' }),
+      idempotencyKey: counterpartyKey,
+    });
+    expect(replay.replayed).toBe(true);
+    expect(replay.revisionId).toBe(r2.revisionId);
+    await expectCredits(0, 1); // idempotent replay
+    await acceptCurrentRevision(pool, ports, {
+      actorPrincipalId: deal.creatorId,
+      correlationId: randomUUID(),
+      dealId: deal.dealId,
+      targetRevisionId: r2.revisionId,
+      idempotencyKey: key(),
+    });
+
+    // Fresh real concurrency from the same accepted base produces one creator successor and one
+    // stale/turn loss. The losing attempt consumes no additional creator credit.
+    const concurrent = await Promise.allSettled(
+      ['a', 'b'].map((branch) =>
+        proposeChanges(pool, ports, {
+          actorPrincipalId: deal.creatorId,
           correlationId: randomUUID(),
           dealId: deal.dealId,
-          baseRevisionId: uuidV7(),
+          baseRevisionId: r2.revisionId,
           termsSchemaId: 'dhamani.goods.v1',
-          rawTerms: terms('Credit derivation', { stale: true }),
+          rawTerms: terms('Credit derivation', { concurrentBranch: branch }),
           idempotencyKey: key(),
         }),
-    ];
-    for (const attempt of nonConsuming) await errorCodeOf(attempt);
+      ),
+    );
+    expect(concurrent.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(concurrent.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    await expectCredits(1, 1); // stale/concurrency loss
+    const r3 = concurrent.find((result) => result.status === 'fulfilled')!.value as Awaited<
+      ReturnType<typeof proposeChanges>
+    >;
+    await acceptCurrentRevision(pool, ports, {
+      actorPrincipalId: deal.counterpartyId,
+      correlationId: randomUUID(),
+      dealId: deal.dealId,
+      targetRevisionId: r3.revisionId,
+      idempotencyKey: key(),
+    });
 
-    const snapshotAfterFailures = {
-      deal: { id: deal.dealId } as never,
-      slots: [] as never,
-      revisions: await revisionRows(pool, deal.dealId),
-      responses: [] as never,
-      currentRevisionIntegrity: 'VERIFIED' as const,
-    };
-    // Credits are derived purely from committed successors in history.
-    expect(committedSuccessorCredits(snapshotAfterFailures as never, deal.counterpartyId)).toBe(0);
-
-    // Two real successors consume exactly two credits; the third is refused.
-    let current = deal.revisionId;
-    for (let round = 0; round < 2; round += 1) {
+    const commitAndAccept = async (principalId: string, counterpartId: string, label: string) => {
+      const current = (await dealRow(pool, deal.dealId)).currentRevisionId;
       const proposal = await proposeChanges(pool, ports, {
-        actorPrincipalId: deal.counterpartyId,
+        actorPrincipalId: principalId,
         correlationId: randomUUID(),
         dealId: deal.dealId,
         baseRevisionId: current,
         termsSchemaId: 'dhamani.goods.v1',
-        rawTerms: terms('Credit derivation', { committed: round }),
+        rawTerms: terms('Credit derivation', { committed: label }),
         idempotencyKey: key(),
       });
       await acceptCurrentRevision(pool, ports, {
-        actorPrincipalId: deal.creatorId,
+        actorPrincipalId: counterpartId,
         correlationId: randomUUID(),
         dealId: deal.dealId,
         targetRevisionId: proposal.revisionId,
         idempotencyKey: key(),
       });
-      current = proposal.revisionId;
+    };
+    await commitAndAccept(deal.counterpartyId, deal.creatorId, 'counterparty-2');
+    await commitAndAccept(deal.creatorId, deal.counterpartyId, 'creator-2');
+    await expectCredits(2, 2);
+
+    const current = (await dealRow(pool, deal.dealId)).currentRevisionId;
+    for (const principalId of [deal.creatorId, deal.counterpartyId]) {
+      expect(
+        await errorCodeOf(() =>
+          proposeChanges(pool, ports, {
+            actorPrincipalId: principalId,
+            correlationId: randomUUID(),
+            dealId: deal.dealId,
+            baseRevisionId: current,
+            termsSchemaId: 'dhamani.goods.v1',
+            rawTerms: terms('Credit derivation', { third: principalId }),
+            idempotencyKey: key(),
+          }),
+        ),
+      ).toBe('MODIFICATION_LIMIT_REACHED');
     }
-    const finalRevisions = await revisionRows(pool, deal.dealId);
-    expect(
-      committedSuccessorCredits(
-        {
-          deal: {} as never,
-          slots: [] as never,
-          revisions: finalRevisions,
-          responses: [] as never,
-          currentRevisionIntegrity: 'VERIFIED' as const,
-        },
-        deal.counterpartyId,
-      ),
-    ).toBe(2);
-    expect(
-      await errorCodeOf(() =>
-        proposeChanges(pool, ports, {
-          actorPrincipalId: deal.counterpartyId,
-          correlationId: randomUUID(),
-          dealId: deal.dealId,
-          baseRevisionId: current,
-          termsSchemaId: 'dhamani.goods.v1',
-          rawTerms: terms('Credit derivation', { committed: 2 }),
-          idempotencyKey: key(),
-        }),
-      ),
-    ).toBe('MODIFICATION_LIMIT_REACHED');
+    await expectCredits(2, 2);
+
+    // Reject is terminal but consumes no successor credit for either participant.
+    const rejected = await bornDeal(pool, { title: 'Credit reject control' });
+    await rejectCurrentRevision(pool, ports, {
+      actorPrincipalId: rejected.counterpartyId,
+      correlationId: randomUUID(),
+      dealId: rejected.dealId,
+      targetRevisionId: rejected.revisionId,
+      idempotencyKey: key(),
+    });
+    const rejectedHistory = await revisionRows(pool, rejected.dealId);
+    expect(rejectedHistory).toHaveLength(1);
+
+    // No mutable credit counter exists: the only authority is immutable successor history.
+    const counters = await pool.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_schema='public' AND column_name ~* '(modification|successor).*credit|credit.*(modification|successor)'`,
+    );
+    expect(counters.rows).toEqual([]);
+    const historySnapshot = {
+      deal: {} as never,
+      slots: [] as never,
+      revisions: await revisionRows(pool, deal.dealId),
+      responses: [] as never,
+      currentRevisionIntegrity: 'VERIFIED' as const,
+    };
+    expect(committedSuccessorCredits(historySnapshot, deal.creatorId)).toBe(2);
+    expect(committedSuccessorCredits(historySnapshot, deal.counterpartyId)).toBe(2);
   });
 
   it('spec001_negotiation_is_turn_based', async () => {

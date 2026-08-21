@@ -150,7 +150,7 @@ export async function withTransaction<T>(
 // Error translation
 // ---------------------------------------------------------------------------
 
-type DriverFailure = Readonly<{ sqlState?: string; constraint?: string }>;
+type DriverFailure = Readonly<{ sqlState?: string; constraint?: string; message?: string }>;
 
 type AdapterCause = Readonly<{ originalCode?: unknown; originalMessage?: unknown }>;
 
@@ -158,7 +158,11 @@ function failureFromAdapterCause(cause: AdapterCause | undefined): DriverFailure
   if (!cause || typeof cause.originalCode !== 'string') return undefined;
   const text = typeof cause.originalMessage === 'string' ? cause.originalMessage : '';
   const named = /constraint "([^"]+)"/.exec(text)?.[1];
-  return { sqlState: cause.originalCode, ...(named ? { constraint: named } : {}) };
+  return {
+    sqlState: cause.originalCode,
+    ...(named ? { constraint: named } : {}),
+    ...(text ? { message: text } : {}),
+  };
 }
 
 /**
@@ -202,13 +206,19 @@ export function driverFailureOf(error: unknown): DriverFailure | undefined {
   if (candidate.code === 'P2010' && typeof candidate.message === 'string') {
     const state = /Code: `([0-9A-Za-z]{5})`/.exec(candidate.message)?.[1];
     const named = /constraint "([^"]+)"/.exec(candidate.message)?.[1];
-    if (state) return { sqlState: state, ...(named ? { constraint: named } : {}) };
+    if (state)
+      return {
+        sqlState: state,
+        ...(named ? { constraint: named } : {}),
+        message: candidate.message,
+      };
   }
 
   if (typeof candidate.code === 'string' && /^[0-9A-Za-z]{5}$/.test(candidate.code)) {
     return {
       sqlState: candidate.code,
       ...(typeof candidate.constraint === 'string' ? { constraint: candidate.constraint } : {}),
+      ...(typeof candidate.message === 'string' ? { message: candidate.message } : {}),
     };
   }
   return undefined;
@@ -223,24 +233,30 @@ const RETRYABLE_SQLSTATES = new Set([
   '40001', // serialization_failure
   '40P01', // deadlock_detected
   '55P03', // lock_not_available
-  '57014', // query_canceled (statement_timeout / lock_timeout)
-  // in_failed_sql_transaction. The kernel never continues issuing statements after an in-flight
-  // failure — every command catches outside `withTransaction` — so this can only mean the pooled
-  // connection handed to this transaction was still inside an aborted block from an earlier
-  // victim. Nothing of this command executed, so it is retryable with the same key, and the
-  // adapter destroys that connection on this failure rather than returning it to the pool again.
-  '25P02',
-  '08000', // connection_exception
-  '08003', // connection_does_not_exist
-  '08006', // connection_failure
 ]);
 
-/** Prisma transaction-lifecycle failures that are safe to retry with the same key. */
-const RETRYABLE_PRISMA_CODES = new Set([
-  'P2024', // timed out fetching a connection from the pool (maxWait)
-  'P2028', // transaction API error, including interactive-transaction timeout
-  'P2034', // write conflict / deadlock
-]);
+function isFrozenTimeout(failure: DriverFailure): boolean {
+  // 57014 is also used for an administrator/user cancellation. Only the concrete PostgreSQL
+  // lock_timeout or statement_timeout forms are Frozen-authorized retryable outcomes.
+  return (
+    failure.sqlState === '57014' &&
+    /canceling statement due to (?:lock|statement) timeout/i.test(failure.message ?? '')
+  );
+}
+
+function isFrozenPrismaTransactionTimeout(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as { code?: unknown; message?: unknown; meta?: unknown };
+  if (candidate.code !== 'P2028') return false;
+  const diagnostic = `${typeof candidate.message === 'string' ? candidate.message : ''} ${
+    candidate.meta === undefined ? '' : JSON.stringify(candidate.meta)
+  }`;
+  // P2028 is a broad Transaction API error. It is retryable only when its concrete diagnostic is
+  // Prisma's configured interactive-transaction timeout/expiry, never merely because of P2028.
+  return /(?:transaction[^.]*timed out|timeout for this transaction|expired transaction)/i.test(
+    diagnostic,
+  );
+}
 
 export function isUniqueViolation(error: unknown, constraint?: string): boolean {
   const failure = driverFailureOf(error);
@@ -251,8 +267,26 @@ export function isUniqueViolation(error: unknown, constraint?: string): boolean 
 export function isRetryableDatabaseError(error: unknown): boolean {
   const failure = driverFailureOf(error);
   if (failure?.sqlState && RETRYABLE_SQLSTATES.has(failure.sqlState)) return true;
+  if (failure && isFrozenTimeout(failure)) return true;
   const code = (error as { code?: unknown } | null)?.code;
-  return typeof code === 'string' && RETRYABLE_PRISMA_CODES.has(code);
+  // P2034 has the exclusive Prisma meaning "transaction conflict or deadlock", both explicitly
+  // authorized by §23.1. Pool acquisition failures, connection failures, 25P02 and broad P2028
+  // failures are not silently widened into the Frozen retryable contract.
+  return code === 'P2034' || isFrozenPrismaTransactionTimeout(error);
+}
+
+/**
+ * Internal/application failure boundary for persistence faults with no Frozen domain meaning.
+ *
+ * This is intentionally not a new `Spec001ErrorCode`. A future transport maps it to its generic
+ * internal-failure behavior; the raw Prisma/PostgreSQL diagnostic remains available only as the
+ * internal `cause` and never becomes the caller-facing message or SQLSTATE contract (§27).
+ */
+export class Spec001PersistenceFailure extends Error {
+  constructor(cause: unknown) {
+    super('SPEC001_INTERNAL_PERSISTENCE_FAILURE', { cause });
+    this.name = 'Spec001PersistenceFailure';
+  }
 }
 
 /**
@@ -273,25 +307,24 @@ const UNIQUE_VIOLATION_CODES: ReadonlyMap<string, Spec001ErrorCode> = new Map([
 /**
  * Never let a raw Prisma/PostgreSQL error become the caller contract (§27).
  *
- * A failure with no stable meaning is deliberately re-thrown rather than dressed up as a contract
- * outcome: inventing a retryable or success-shaped answer for an unknown persistence fault would
- * hide a real defect behind a stable-looking code.
+ * A failure with no stable meaning is contained behind `Spec001PersistenceFailure` rather than
+ * dressed up as a contract outcome: inventing a retryable or success-shaped answer for an unknown
+ * persistence fault would hide a real defect behind a stable-looking code.
  */
-export function mapDatabaseError(error: unknown): Spec001Error {
+export function mapDatabaseError(error: unknown): Spec001Error | Spec001PersistenceFailure {
   if (error instanceof Spec001Error) return error;
   if (isRetryableDatabaseError(error)) return new Spec001Error('DEAL_WRITE_RETRYABLE');
   const failure = driverFailureOf(error);
   if (failure?.sqlState === '23505') {
     const mapped = UNIQUE_VIOLATION_CODES.get(failure.constraint ?? '');
-    // An unrecognised unique constraint is re-thrown rather than described as an unrelated domain
-    // conflict. Labelling an unknown persistence failure `REVISION_RESPONSE_CONFLICT` would be a
-    // false stable contract, and the Frozen SPEC nowhere requires such a fallback.
-    if (!mapped) throw error;
+    // An unrecognised unique constraint must not be described as an unrelated domain conflict,
+    // but its raw driver object must not escape either.
+    if (!mapped) return new Spec001PersistenceFailure(error);
     return new Spec001Error(mapped, {
       ...(failure.constraint ? { field: failure.constraint } : {}),
     });
   }
-  throw error;
+  return new Spec001PersistenceFailure(error);
 }
 
 /** Exactly one authoritative wall-clock read per command (§29). */

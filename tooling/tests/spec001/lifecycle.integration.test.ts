@@ -389,57 +389,67 @@ describe('SPEC-001 negotiation lifecycle against real PostgreSQL', () => {
 
   it('spec001_e18_modification_limits', async () => {
     const deal = await bornDeal(pool, { title: 'Credit limit deal' });
-    const counterpartyProposals: string[] = [];
-    for (let index = 0; index < 2; index += 1) {
+    const acceptedSuccessor = async (principalId: string, counterpartId: string, round: number) => {
       const current = (await dealRow(pool, deal.dealId)).currentRevisionId;
       const proposal = await proposeChanges(pool, ports, {
-        actorPrincipalId: deal.counterpartyId,
+        actorPrincipalId: principalId,
         correlationId: randomUUID(),
         dealId: deal.dealId,
         baseRevisionId: current,
         termsSchemaId: 'dhamani.goods.v1',
-        rawTerms: terms('Credit limit deal', { counterpartyRound: index }),
+        rawTerms: terms('Credit limit deal', { principalId, round }),
         idempotencyKey: key(),
       });
-      counterpartyProposals.push(proposal.revisionId);
-      // Hand the turn back so the next proposal is not blocked by turn-taking instead.
       await acceptCurrentRevision(pool, ports, {
-        actorPrincipalId: deal.creatorId,
+        actorPrincipalId: counterpartId,
         correlationId: randomUUID(),
         dealId: deal.dealId,
         targetRevisionId: proposal.revisionId,
         idempotencyKey: key(),
       });
-    }
-    expect(counterpartyProposals).toHaveLength(2);
+      return proposal;
+    };
 
-    // A third committed successor by the same Principal is refused.
-    const currentAfterTwo = (await dealRow(pool, deal.dealId)).currentRevisionId;
+    // The counterparty consumes both credits first; the creator still retains both independently.
+    await acceptedSuccessor(deal.counterpartyId, deal.creatorId, 0);
+    await acceptedSuccessor(deal.counterpartyId, deal.creatorId, 1);
+    await acceptedSuccessor(deal.creatorId, deal.counterpartyId, 0);
+    await acceptedSuccessor(deal.creatorId, deal.counterpartyId, 1);
+
+    const revisions = await revisionRows(pool, deal.dealId);
+    expect(revisions).toHaveLength(5); // R1 + two committed successors by each Principal.
     expect(
-      await errorCodeOf(() =>
-        proposeChanges(pool, ports, {
-          actorPrincipalId: deal.counterpartyId,
-          correlationId: randomUUID(),
-          dealId: deal.dealId,
-          baseRevisionId: currentAfterTwo,
-          termsSchemaId: 'dhamani.goods.v1',
-          rawTerms: terms('Credit limit deal', { counterpartyRound: 2 }),
-          idempotencyKey: key(),
-        }),
+      revisions.filter(
+        (revision) =>
+          revision.revisionNumber > 1 && revision.createdByPrincipalId === deal.counterpartyId,
       ),
-    ).toBe('MODIFICATION_LIMIT_REACHED');
+    ).toHaveLength(2);
+    expect(
+      revisions.filter(
+        (revision) =>
+          revision.revisionNumber > 1 && revision.createdByPrincipalId === deal.creatorId,
+      ),
+    ).toHaveLength(2);
 
-    // Credits are per participant: the creator's own two are untouched by the counterpart's use.
-    const creatorProposal = await proposeChanges(pool, ports, {
-      actorPrincipalId: deal.creatorId,
-      correlationId: randomUUID(),
-      dealId: deal.dealId,
-      baseRevisionId: currentAfterTwo,
-      termsSchemaId: 'dhamani.goods.v1',
-      rawTerms: terms('Credit limit deal', { creatorRound: 0 }),
-      idempotencyKey: key(),
-    });
-    expect(creatorProposal.revisionNumber).toBe(4);
+    const current = (await dealRow(pool, deal.dealId)).currentRevisionId;
+    for (const [principalId, label] of [
+      [deal.counterpartyId, 'counterparty'],
+      [deal.creatorId, 'creator'],
+    ] as const) {
+      expect(
+        await errorCodeOf(() =>
+          proposeChanges(pool, ports, {
+            actorPrincipalId: principalId,
+            correlationId: randomUUID(),
+            dealId: deal.dealId,
+            baseRevisionId: current,
+            termsSchemaId: 'dhamani.goods.v1',
+            rawTerms: terms('Credit limit deal', { thirdFor: label }),
+            idempotencyKey: key(),
+          }),
+        ),
+      ).toBe('MODIFICATION_LIMIT_REACHED');
+    }
   });
 
   it('spec001_e20_duplicate_accept_retry', async () => {

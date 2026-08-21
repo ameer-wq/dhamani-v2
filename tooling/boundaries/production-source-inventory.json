@@ -40,6 +40,7 @@
     "apps/api/src/app.module.ts",
     "apps/api/src/bootstrap.ts",
     "apps/api/src/main.ts",
+    "apps/api/src/spec001/application-readiness.ts",
     "apps/api/src/spec001/commands/accept-current-revision.ts",
     "apps/api/src/spec001/commands/bind-counterparty-principal.ts",
     "apps/api/src/spec001/commands/create-formal-deal.ts",

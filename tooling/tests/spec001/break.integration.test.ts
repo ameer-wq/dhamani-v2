@@ -8,6 +8,7 @@ import {
   isRetryableDatabaseError,
   isUniqueViolation,
   mapDatabaseError,
+  Spec001PersistenceFailure,
 } from '../../../apps/api/src/spec001/database.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
 import { proposeChanges } from '../../../apps/api/src/spec001/commands/propose-changes.ts';
@@ -82,8 +83,13 @@ describe('SPEC-001 adversarial break probes', () => {
   it('spec001_unique_violations_map_to_specific_frozen_codes', () => {
     // A unique violation must not collapse into one generic code: each constraint carries a
     // distinct, frozen §27 meaning.
-    const violation = (constraint: string) =>
-      mapDatabaseError(Object.assign(new Error('duplicate key'), { code: '23505', constraint }));
+    const violation = (constraint: string): Spec001Error => {
+      const mapped = mapDatabaseError(
+        Object.assign(new Error('duplicate key'), { code: '23505', constraint }),
+      );
+      expect(mapped).toBeInstanceOf(Spec001Error);
+      return mapped as Spec001Error;
+    };
 
     expect(violation('RevisionResponse_revision_principal_key').code).toBe(
       'REVISION_ALREADY_RESPONDED',
@@ -93,22 +99,75 @@ describe('SPEC-001 adversarial break probes', () => {
     expect(violation('ApplicationIdempotencyRecord_claim_key').code).toBe(
       'IDEMPOTENT_REQUEST_IN_PROGRESS',
     );
-    // An UNRECOGNISED unique constraint must NOT be relabelled as an unrelated stable domain
-    // conflict. It is re-thrown, so an unknown persistence failure cannot masquerade as contract.
-    expect(() => violation('some_future_constraint')).toThrow();
-    let mislabelled: string | undefined;
-    try {
-      mislabelled = violation('some_future_constraint').code;
-    } catch {
-      mislabelled = undefined;
-    }
-    expect(mislabelled).toBeUndefined();
+    // An UNRECOGNISED unique constraint is neither falsely relabelled nor allowed to escape as
+    // the original pg/Prisma object.
+    const unknownUniqueRaw = Object.assign(new Error('duplicate raw detail'), {
+      code: '23505',
+      constraint: 'some_future_constraint',
+    });
+    const unknownUnique = mapDatabaseError(unknownUniqueRaw);
+    expect(unknownUnique).toBeInstanceOf(Spec001PersistenceFailure);
+    expect(unknownUnique).not.toBeInstanceOf(Spec001Error);
+    expect(unknownUnique).not.toBe(unknownUniqueRaw);
+    expect(unknownUnique.message).toBe('SPEC001_INTERNAL_PERSISTENCE_FAILURE');
+    expect(unknownUnique.message).not.toContain('23505');
+    expect(unknownUnique.cause).toBe(unknownUniqueRaw);
 
-    // Every retryable SQLSTATE maps to the single retryable contract.
-    for (const code of ['40001', '40P01', '55P03', '57014', '08006']) {
+    // SQLSTATEs with an exclusive Frozen meaning map to the retryable contract.
+    for (const code of ['40001', '40P01', '55P03']) {
       const mapped = mapDatabaseError(Object.assign(new Error('transient'), { code }));
-      expect(mapped.code, code).toBe('DEAL_WRITE_RETRYABLE');
+      expect(mapped).toBeInstanceOf(Spec001Error);
+      expect((mapped as Spec001Error).code, code).toBe('DEAL_WRITE_RETRYABLE');
       expect(isRetryableDatabaseError({ code })).toBe(true);
+    }
+    for (const message of [
+      'canceling statement due to lock timeout',
+      'canceling statement due to statement timeout',
+    ]) {
+      const failure = { code: '57014', message };
+      expect(isRetryableDatabaseError(failure)).toBe(true);
+      expect((mapDatabaseError(failure) as Spec001Error).code).toBe('DEAL_WRITE_RETRYABLE');
+    }
+    expect(isRetryableDatabaseError({ code: 'P2034' })).toBe(true);
+    expect((mapDatabaseError({ code: 'P2034' }) as Spec001Error).code).toBe('DEAL_WRITE_RETRYABLE');
+    const timedOutTransaction = {
+      code: 'P2028',
+      message: 'Transaction already closed: timeout for this transaction was 10000 ms',
+    };
+    expect(isRetryableDatabaseError(timedOutTransaction)).toBe(true);
+    expect((mapDatabaseError(timedOutTransaction) as Spec001Error).code).toBe(
+      'DEAL_WRITE_RETRYABLE',
+    );
+
+    // These broad codes do not acquire retryable semantics merely from their classification.
+    for (const failure of [
+      { code: '25P02', message: 'current transaction is aborted' },
+      { code: '08000', message: 'connection exception' },
+      { code: '08003', message: 'connection does not exist' },
+      { code: '08006', message: 'connection failure' },
+      { code: 'P2024', message: 'timed out fetching a pool connection' },
+      { code: 'P2028', message: 'Transaction API error: transaction not found' },
+      { code: '57014', message: 'canceling statement due to user request' },
+    ]) {
+      expect(isRetryableDatabaseError(failure), String(failure.code)).toBe(false);
+      expect(mapDatabaseError(failure), String(failure.code)).toBeInstanceOf(
+        Spec001PersistenceFailure,
+      );
+    }
+
+    // Unknown SQLSTATE and Prisma/adapter failures share the same clean boundary. Raw diagnostics
+    // survive only as the internal cause, never in the stable outward message.
+    for (const raw of [
+      Object.assign(new Error('raw check violation'), { code: '23514' }),
+      Object.assign(new Error('raw prisma adapter detail'), { code: 'P9999' }),
+      Object.assign(new Error('unshaped persistence detail'), { adapter: 'future' }),
+    ]) {
+      const boundary = mapDatabaseError(raw);
+      expect(boundary).toBeInstanceOf(Spec001PersistenceFailure);
+      expect(boundary).not.toBe(raw);
+      expect(boundary.message).toBe('SPEC001_INTERNAL_PERSISTENCE_FAILURE');
+      expect(boundary.message).not.toMatch(/23514|P9999|raw/i);
+      expect(boundary.cause).toBe(raw);
     }
 
     // A domain error passes through unchanged rather than being re-wrapped.
@@ -254,7 +313,10 @@ describe('SPEC-001 adversarial break probes', () => {
       });
     } catch (error) {
       code = error instanceof Spec001Error ? error.code : `UNEXPECTED:${String(error)}`;
-      if (!(error instanceof Spec001Error)) code = mapDatabaseError(error).code;
+      if (!(error instanceof Spec001Error)) {
+        const mapped = mapDatabaseError(error);
+        code = mapped instanceof Spec001Error ? mapped.code : `UNEXPECTED:${mapped.name}`;
+      }
     }
     expect(code).toBe('DEAL_WRITE_RETRYABLE');
     // It was interrupted at roughly the configured timeout rather than running to completion.

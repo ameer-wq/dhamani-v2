@@ -1,4 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { PassThrough } from 'node:stream';
+import { resolveRuntimeConfig } from '../../../packages/config/src/index.ts';
+import { createApi } from '../../../apps/api/src/bootstrap.ts';
 import {
   MAX_RAW_BYTES,
   Spec001Error,
@@ -210,152 +213,333 @@ describe('SPEC-001 integrity, idempotency and security invariants', () => {
   it('spec001_all_write_commands_are_idempotent', async () => {
     // Table-driven across all seven keyed commands. ExpireInvitationIfDue is deliberately absent:
     // it is state-idempotent and takes no caller key (§22.1).
-    type Case = { name: string; run: (idempotencyKey: string) => Promise<unknown> };
+    type Case = {
+      name: string;
+      scope: string;
+      run: (idempotencyKey: string) => Promise<unknown>;
+      assertSingleEffect: (committed: Record<string, unknown>) => Promise<void>;
+    };
     const cases: Case[] = [];
 
-    // The actor and target are fixed: the idempotency scope is PRINCIPAL:<actor>, so a fresh
-    // actor per call would be a different semantic command rather than a retry.
-    const createActor = randomUUID();
-    const createCounterparty = randomUUID();
-    cases.push({
-      name: 'CreateFormalDeal',
-      run: (idempotencyKey) =>
-        createFormalDeal(pool, ports, {
-          actorPrincipalId: createActor,
-          correlationId: randomUUID(),
-          dealType: 'GOODS',
-          creatorRole: 'BUYER',
-          counterpartyTarget: { kind: 'PRINCIPAL', principalId: createCounterparty },
-          termsSchemaId: 'dhamani.goods.v1',
-          rawTerms: terms('Idempotent create probe'),
-          idempotencyKey,
-        }),
-    });
+    // A temporary real-PostgreSQL gate keeps every fresh claimant inside its first INSERT long
+    // enough for all sibling transactions to overlap before any winner can commit. This is not a
+    // production hook and is removed before the test returns.
+    await pool.query(
+      'CREATE TABLE IF NOT EXISTS spec001_test_r4_idempotency_gate (idempotency_key text primary key)',
+    );
+    await pool.query('TRUNCATE spec001_test_r4_idempotency_gate');
+    await pool.query(`CREATE OR REPLACE FUNCTION spec001_test_r4_idempotency_overlap()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $fn$ BEGIN
+          IF EXISTS (SELECT 1 FROM spec001_test_r4_idempotency_gate g
+                      WHERE g.idempotency_key = NEW."idempotencyKey") THEN
+            PERFORM pg_sleep(0.35);
+          END IF;
+          RETURN NEW;
+        END; $fn$;`);
+    await pool.query(
+      'DROP TRIGGER IF EXISTS "ApplicationIdempotencyRecord_r4_overlap" ON "ApplicationIdempotencyRecord"',
+    );
+    await pool.query(`CREATE TRIGGER "ApplicationIdempotencyRecord_r4_overlap"
+        BEFORE INSERT ON "ApplicationIdempotencyRecord" FOR EACH ROW
+        EXECUTE FUNCTION spec001_test_r4_idempotency_overlap()`);
 
-    const pendingInviteId = randomUUID();
-    const pendingBorn = await createFormalDeal(pool, ports, {
-      actorPrincipalId: randomUUID(),
-      correlationId: randomUUID(),
-      dealType: 'GOODS',
-      creatorRole: 'BUYER',
-      counterpartyTarget: { kind: 'PENDING_INVITE', pendingInviteId },
-      termsSchemaId: 'dhamani.goods.v1',
-      rawTerms: terms('Idempotent bind'),
-      idempotencyKey: key(),
-    });
-    const bindPrincipal = randomUUID();
-    cases.push({
-      name: 'BindCounterpartyPrincipal',
-      run: (idempotencyKey) =>
-        bindCounterpartyPrincipal(pool, ports, {
-          trustedCaller: 'identity-service',
-          correlationId: randomUUID(),
-          dealId: pendingBorn.dealId,
-          pendingInviteId,
-          principalId: bindPrincipal,
-          idempotencyKey,
-        }),
-    });
+    try {
+      // The actor and target are fixed: the idempotency scope is PRINCIPAL:<actor>, so a fresh
+      // actor per call would be a different semantic command rather than a retry.
+      const createActor = randomUUID();
+      const createCounterparty = randomUUID();
+      cases.push({
+        name: 'CreateFormalDeal',
+        scope: `PRINCIPAL:${createActor}`,
+        run: (idempotencyKey) =>
+          createFormalDeal(pool, ports, {
+            actorPrincipalId: createActor,
+            correlationId: randomUUID(),
+            dealType: 'GOODS',
+            creatorRole: 'BUYER',
+            counterpartyTarget: { kind: 'PRINCIPAL', principalId: createCounterparty },
+            termsSchemaId: 'dhamani.goods.v1',
+            rawTerms: terms('Idempotent create probe'),
+            idempotencyKey,
+          }),
+        assertSingleEffect: async (committed) => {
+          const facts = await pool.query<{
+            deals: number;
+            slots: number;
+            revisions: number;
+            responses: number;
+            events: number;
+          }>(
+            `SELECT
+             (SELECT count(*)::int FROM "Deal" WHERE "id"=$1) AS deals,
+             (SELECT count(*)::int FROM "DealPartySlot" WHERE "dealId"=$1) AS slots,
+             (SELECT count(*)::int FROM "AgreementRevision" WHERE "dealId"=$1) AS revisions,
+             (SELECT count(*)::int FROM "RevisionResponse" WHERE "dealId"=$1) AS responses,
+             (SELECT count(*)::int FROM "DealAgreementAuditEvent" WHERE "dealId"=$1) AS events`,
+            [committed.dealId],
+          );
+          expect(facts.rows[0]).toEqual({
+            deals: 1,
+            slots: 2,
+            revisions: 1,
+            responses: 1,
+            events: 3,
+          });
+        },
+      });
 
-    const acceptDeal = await bornDeal(pool, { title: 'Idempotent accept' });
-    cases.push({
-      name: 'AcceptCurrentRevision',
-      run: (idempotencyKey) =>
-        acceptCurrentRevision(pool, ports, {
-          actorPrincipalId: acceptDeal.counterpartyId,
-          correlationId: randomUUID(),
-          dealId: acceptDeal.dealId,
-          targetRevisionId: acceptDeal.revisionId,
-          idempotencyKey,
-        }),
-    });
+      const pendingInviteId = randomUUID();
+      const pendingBorn = await createFormalDeal(pool, ports, {
+        actorPrincipalId: randomUUID(),
+        correlationId: randomUUID(),
+        dealType: 'GOODS',
+        creatorRole: 'BUYER',
+        counterpartyTarget: { kind: 'PENDING_INVITE', pendingInviteId },
+        termsSchemaId: 'dhamani.goods.v1',
+        rawTerms: terms('Idempotent bind'),
+        idempotencyKey: key(),
+      });
+      const bindPrincipal = randomUUID();
+      cases.push({
+        name: 'BindCounterpartyPrincipal',
+        scope: 'TRUSTED_IDENTITY:identity-service',
+        run: (idempotencyKey) =>
+          bindCounterpartyPrincipal(pool, ports, {
+            trustedCaller: 'identity-service',
+            correlationId: randomUUID(),
+            dealId: pendingBorn.dealId,
+            pendingInviteId,
+            principalId: bindPrincipal,
+            idempotencyKey,
+          }),
+        assertSingleEffect: async () => {
+          const slot = await pool.query<{ principalId: string; boundAt: Date }>(
+            `SELECT "principalId" AS "principalId","boundAt" AS "boundAt"
+             FROM "DealPartySlot" WHERE "dealId"=$1 AND "slotKind"='COUNTERPARTY'`,
+            [pendingBorn.dealId],
+          );
+          expect(slot.rows[0]!.principalId).toBe(bindPrincipal);
+          expect(slot.rows[0]!.boundAt).toBeInstanceOf(Date);
+          expect(
+            (await auditEvents(pool, pendingBorn.dealId)).filter(
+              (event) => event === 'COUNTERPARTY_BOUND',
+            ),
+          ).toHaveLength(1);
+        },
+      });
 
-    const rejectDeal = await bornDeal(pool, { title: 'Idempotent reject' });
-    cases.push({
-      name: 'RejectCurrentRevision',
-      run: (idempotencyKey) =>
-        rejectCurrentRevision(pool, ports, {
-          actorPrincipalId: rejectDeal.counterpartyId,
-          correlationId: randomUUID(),
-          dealId: rejectDeal.dealId,
-          targetRevisionId: rejectDeal.revisionId,
-          idempotencyKey,
-        }),
-    });
+      const acceptDeal = await bornDeal(pool, { title: 'Idempotent accept' });
+      cases.push({
+        name: 'AcceptCurrentRevision',
+        scope: `PRINCIPAL:${acceptDeal.counterpartyId}`,
+        run: (idempotencyKey) =>
+          acceptCurrentRevision(pool, ports, {
+            actorPrincipalId: acceptDeal.counterpartyId,
+            correlationId: randomUUID(),
+            dealId: acceptDeal.dealId,
+            targetRevisionId: acceptDeal.revisionId,
+            idempotencyKey,
+          }),
+        assertSingleEffect: async () => {
+          expect(
+            (await responseRows(pool, acceptDeal.dealId)).filter(
+              (response) => response.responseOrigin === 'EXPLICIT',
+            ),
+          ).toHaveLength(1);
+          expect((await dealRow(pool, acceptDeal.dealId)).version).toBe(2);
+          expect(
+            (await auditEvents(pool, acceptDeal.dealId)).filter(
+              (event) => event === 'MUTUAL_ACCEPTANCE_REACHED',
+            ),
+          ).toHaveLength(1);
+        },
+      });
 
-    const proposeDeal = await bornDeal(pool, { title: 'Idempotent propose' });
-    cases.push({
-      name: 'ProposeChanges',
-      run: (idempotencyKey) =>
-        proposeChanges(pool, ports, {
-          actorPrincipalId: proposeDeal.counterpartyId,
-          correlationId: randomUUID(),
-          dealId: proposeDeal.dealId,
-          baseRevisionId: proposeDeal.revisionId,
-          termsSchemaId: 'dhamani.goods.v1',
-          rawTerms: terms('Idempotent propose', { v: 2 }),
-          idempotencyKey,
-        }),
-    });
+      const rejectDeal = await bornDeal(pool, { title: 'Idempotent reject' });
+      cases.push({
+        name: 'RejectCurrentRevision',
+        scope: `PRINCIPAL:${rejectDeal.counterpartyId}`,
+        run: (idempotencyKey) =>
+          rejectCurrentRevision(pool, ports, {
+            actorPrincipalId: rejectDeal.counterpartyId,
+            correlationId: randomUUID(),
+            dealId: rejectDeal.dealId,
+            targetRevisionId: rejectDeal.revisionId,
+            idempotencyKey,
+          }),
+        assertSingleEffect: async () => {
+          expect((await dealRow(pool, rejectDeal.dealId)).terminationReason).toBe('REJECTED');
+          expect(
+            (await responseRows(pool, rejectDeal.dealId)).filter(
+              (response) => response.responseKind === 'REJECT',
+            ),
+          ).toHaveLength(1);
+          expect(
+            (await auditEvents(pool, rejectDeal.dealId)).filter(
+              (event) => event === 'REVISION_REJECTED',
+            ),
+          ).toHaveLength(1);
+        },
+      });
 
-    const withdrawDeal = await bornDeal(pool, { title: 'Idempotent withdraw' });
-    cases.push({
-      name: 'WithdrawInvitation',
-      run: (idempotencyKey) =>
-        withdrawInvitation(pool, ports, {
-          actorPrincipalId: withdrawDeal.creatorId,
-          correlationId: randomUUID(),
-          dealId: withdrawDeal.dealId,
-          targetRevisionId: withdrawDeal.revisionId,
-          idempotencyKey,
-        }),
-    });
+      const proposeDeal = await bornDeal(pool, { title: 'Idempotent propose' });
+      cases.push({
+        name: 'ProposeChanges',
+        scope: `PRINCIPAL:${proposeDeal.counterpartyId}`,
+        run: (idempotencyKey) =>
+          proposeChanges(pool, ports, {
+            actorPrincipalId: proposeDeal.counterpartyId,
+            correlationId: randomUUID(),
+            dealId: proposeDeal.dealId,
+            baseRevisionId: proposeDeal.revisionId,
+            termsSchemaId: 'dhamani.goods.v1',
+            rawTerms: terms('Idempotent propose', { v: 2 }),
+            idempotencyKey,
+          }),
+        assertSingleEffect: async (committed) => {
+          expect(await revisionRows(pool, proposeDeal.dealId)).toHaveLength(2);
+          expect((await dealRow(pool, proposeDeal.dealId)).currentRevisionId).toBe(
+            committed.revisionId,
+          );
+          expect(
+            (await auditEvents(pool, proposeDeal.dealId)).filter(
+              (event) => event === 'CURRENT_REVISION_ADVANCED',
+            ),
+          ).toHaveLength(1);
+        },
+      });
 
-    const negotiationDeal = await bornDeal(pool, { title: 'Idempotent negotiation withdraw' });
-    const negotiationSuccessor = await proposeChanges(pool, ports, {
-      actorPrincipalId: negotiationDeal.counterpartyId,
-      correlationId: randomUUID(),
-      dealId: negotiationDeal.dealId,
-      baseRevisionId: negotiationDeal.revisionId,
-      termsSchemaId: 'dhamani.goods.v1',
-      rawTerms: terms('Idempotent negotiation withdraw', { v: 2 }),
-      idempotencyKey: key(),
-    });
-    cases.push({
-      name: 'WithdrawNegotiation',
-      run: (idempotencyKey) =>
-        withdrawNegotiation(pool, ports, {
-          actorPrincipalId: negotiationDeal.counterpartyId,
-          correlationId: randomUUID(),
-          dealId: negotiationDeal.dealId,
-          targetRevisionId: negotiationSuccessor.revisionId,
-          idempotencyKey,
-        }),
-    });
+      const withdrawDeal = await bornDeal(pool, { title: 'Idempotent withdraw' });
+      cases.push({
+        name: 'WithdrawInvitation',
+        scope: `PRINCIPAL:${withdrawDeal.creatorId}`,
+        run: (idempotencyKey) =>
+          withdrawInvitation(pool, ports, {
+            actorPrincipalId: withdrawDeal.creatorId,
+            correlationId: randomUUID(),
+            dealId: withdrawDeal.dealId,
+            targetRevisionId: withdrawDeal.revisionId,
+            idempotencyKey,
+          }),
+        assertSingleEffect: async () => {
+          const row = await dealRow(pool, withdrawDeal.dealId);
+          expect(row.terminationReason).toBe('INVITATION_WITHDRAWN');
+          expect(row.version).toBe(2);
+          expect(
+            (await auditEvents(pool, withdrawDeal.dealId)).filter(
+              (event) => event === 'INVITATION_WITHDRAWN',
+            ),
+          ).toHaveLength(1);
+        },
+      });
 
-    expect(cases).toHaveLength(7);
-    for (const testCase of cases) {
-      const commandKey = key();
-      const first = (await testCase.run(commandKey)) as { replayed: boolean };
-      expect(first.replayed, `${testCase.name} first call`).toBe(false);
-      // Sequential replays return the identical committed outcome.
-      for (let attempt = 0; attempt < 3; attempt += 1) {
+      const negotiationDeal = await bornDeal(pool, { title: 'Idempotent negotiation withdraw' });
+      const negotiationSuccessor = await proposeChanges(pool, ports, {
+        actorPrincipalId: negotiationDeal.counterpartyId,
+        correlationId: randomUUID(),
+        dealId: negotiationDeal.dealId,
+        baseRevisionId: negotiationDeal.revisionId,
+        termsSchemaId: 'dhamani.goods.v1',
+        rawTerms: terms('Idempotent negotiation withdraw', { v: 2 }),
+        idempotencyKey: key(),
+      });
+      cases.push({
+        name: 'WithdrawNegotiation',
+        scope: `PRINCIPAL:${negotiationDeal.counterpartyId}`,
+        run: (idempotencyKey) =>
+          withdrawNegotiation(pool, ports, {
+            actorPrincipalId: negotiationDeal.counterpartyId,
+            correlationId: randomUUID(),
+            dealId: negotiationDeal.dealId,
+            targetRevisionId: negotiationSuccessor.revisionId,
+            idempotencyKey,
+          }),
+        assertSingleEffect: async () => {
+          const row = await dealRow(pool, negotiationDeal.dealId);
+          expect(row.terminationReason).toBe('NEGOTIATION_WITHDRAWN');
+          expect(row.version).toBe(3);
+          expect(
+            (await auditEvents(pool, negotiationDeal.dealId)).filter(
+              (event) => event === 'NEGOTIATION_WITHDRAWN',
+            ),
+          ).toHaveLength(1);
+        },
+      });
+
+      expect(cases).toHaveLength(7);
+      for (const testCase of cases) {
+        const commandKey = key();
+        const existingClaim = await pool.query<{ count: number }>(
+          `SELECT count(*)::int AS count FROM "ApplicationIdempotencyRecord"
+          WHERE "scope"=$1 AND "commandType"=$2 AND "idempotencyKey"=$3`,
+          [testCase.scope, testCase.name, commandKey],
+        );
+        expect(existingClaim.rows[0]!.count, `${testCase.name} must start fresh`).toBe(0);
+        await pool.query(
+          'INSERT INTO spec001_test_r4_idempotency_gate (idempotency_key) VALUES ($1)',
+          [commandKey],
+        );
+
+        // Every call below is a first-attempt call dispatched before an outcome exists. The DB gate
+        // above ensures their real transactions overlap at the unique claim.
+        const concurrent = await Promise.allSettled(
+          Array.from({ length: 6 }, () => testCase.run(commandKey)),
+        );
+        await pool.query('DELETE FROM spec001_test_r4_idempotency_gate WHERE idempotency_key=$1', [
+          commandKey,
+        ]);
+
+        const fulfilled = concurrent
+          .filter(
+            (outcome): outcome is PromiseFulfilledResult<unknown> => outcome.status === 'fulfilled',
+          )
+          .map((outcome) => outcome.value as Record<string, unknown>);
+        expect(fulfilled.length, `${testCase.name} must have a committed winner`).toBeGreaterThan(
+          0,
+        );
+        expect(
+          fulfilled.filter((outcome) => outcome.replayed === false),
+          `${testCase.name} one authoritative executor`,
+        ).toHaveLength(1);
+        for (const outcome of concurrent) {
+          if (outcome.status === 'rejected') {
+            expect(outcome.reason).toBeInstanceOf(Spec001Error);
+            expect((outcome.reason as Spec001Error).code).not.toBe('IDEMPOTENCY_CONFLICT');
+            expect(['DEAL_WRITE_RETRYABLE', 'IDEMPOTENT_REQUEST_IN_PROGRESS']).toContain(
+              (outcome.reason as Spec001Error).code,
+            );
+          }
+        }
+
+        const first = fulfilled.find((outcome) => outcome.replayed === false)!;
+        await testCase.assertSingleEffect(first);
+        const claim = await pool.query<{ count: number }>(
+          `SELECT count(*)::int AS count FROM "ApplicationIdempotencyRecord"
+          WHERE "scope"=$1 AND "commandType"=$2 AND "idempotencyKey"=$3`,
+          [testCase.scope, testCase.name, commandKey],
+        );
+        expect(claim.rows[0]!.count).toBe(1);
+
+        // After convergence, the same key returns the exact immutable original commit-time facts.
         const replay = (await testCase.run(commandKey)) as Record<string, unknown>;
-        expect(replay.replayed, `${testCase.name} replay`).toBe(true);
+        expect(replay.replayed, `${testCase.name} converged replay`).toBe(true);
         for (const [field, value] of Object.entries(first)) {
           if (field === 'replayed') continue;
           expect(replay[field], `${testCase.name}.${field}`).toEqual(value);
         }
       }
-      // Concurrent replays under the same key converge on one committed outcome.
-      const concurrent = await Promise.allSettled(
-        Array.from({ length: 6 }, () => testCase.run(commandKey)),
-      );
-      for (const outcome of concurrent) {
-        if (outcome.status === 'fulfilled')
-          expect((outcome.value as { replayed: boolean }).replayed).toBe(true);
-        else expect(outcome.reason).toBeInstanceOf(Spec001Error);
-      }
+    } finally {
+      await pool
+        .query(
+          'DROP TRIGGER IF EXISTS "ApplicationIdempotencyRecord_r4_overlap" ON "ApplicationIdempotencyRecord"',
+        )
+        .catch(() => undefined);
+      await pool
+        .query('DROP FUNCTION IF EXISTS spec001_test_r4_idempotency_overlap()')
+        .catch(() => undefined);
+      await pool
+        .query('DROP TABLE IF EXISTS spec001_test_r4_idempotency_gate')
+        .catch(() => undefined);
     }
   });
 
@@ -773,54 +957,143 @@ describe('SPEC-001 integrity, idempotency and security invariants', () => {
   });
 
   it('spec001_audit_and_logs_contain_no_terms_or_pii', async () => {
-    // Unique sentinel contractual/PII-shaped values.
+    // Unique sentinel contractual/PII-shaped values. The PII values are exercised at an
+    // invite-like top-level boundary that the closed terms envelope rejects; they are not placed
+    // inside legitimate business terms, where ordinary text is intentionally contractual data.
     const titleSentinel = 'SENTINEL-TITLE-8f2b7c1e';
+    const contractSentinel = 'SENTINEL-CONTRACT-DESCRIPTION-51c4';
     const piiSentinel = 'sentinel.person+9f31@example.invalid';
     const phoneSentinel = '+9647701234567';
-    const born = await createFormalDeal(pool, ports, {
-      actorPrincipalId: randomUUID(),
-      correlationId: randomUUID(),
-      dealType: 'GOODS',
-      creatorRole: 'BUYER',
-      counterpartyTarget: { kind: 'PRINCIPAL', principalId: randomUUID() },
-      termsSchemaId: 'dhamani.goods.v1',
-      rawTerms: new TextEncoder().encode(
-        JSON.stringify({
-          common: { title: titleSentinel, description: `${piiSentinel} ${phoneSentinel}` },
-          typeTerms: { contact: piiSentinel },
-        }),
-      ),
-      idempotencyKey: key(),
+    const usernameSentinel = 'invite_username_73ab';
+
+    // Capture the real configured Pino destination from the actual Nest application path.
+    const output = new PassThrough();
+    let logs = '';
+    output.on('data', (chunk) => {
+      logs += String(chunk);
     });
-
-    const audit = await pool.query<{ row: string }>(
-      `SELECT row_to_json(e)::text AS row FROM "DealAgreementAuditEvent" e WHERE "dealId"=$1`,
-      [born.dealId],
+    const app = await createApi(
+      resolveRuntimeConfig({
+        DHAMANI_RUNTIME_MODE: 'test',
+        DATABASE_URL: runtimeConnectionString(),
+        DHAMANI_PRIVATE_SENTINEL: 'spec001-log-config-sentinel',
+        PORT: '3012',
+      }),
+      output,
     );
-    expect(audit.rowCount).toBeGreaterThan(0);
-    for (const row of audit.rows) {
-      expect(row.row).not.toContain(titleSentinel);
-      expect(row.row).not.toContain(piiSentinel);
-      expect(row.row).not.toContain(phoneSentinel);
+    await app.listen(0);
+    try {
+      const address = app.getHttpServer().address() as { port: number };
+      await fetch(`http://127.0.0.1:${address.port}/health/live`);
+
+      const pendingInviteId = randomUUID();
+      const born = await createFormalDeal(pool, ports, {
+        actorPrincipalId: randomUUID(),
+        correlationId: randomUUID(),
+        dealType: 'GOODS',
+        creatorRole: 'BUYER',
+        counterpartyTarget: { kind: 'PENDING_INVITE', pendingInviteId },
+        termsSchemaId: 'dhamani.goods.v1',
+        rawTerms: new TextEncoder().encode(
+          JSON.stringify({
+            common: { title: titleSentinel, description: contractSentinel },
+            typeTerms: { businessNote: 'ordinary inert data' },
+          }),
+        ),
+        idempotencyKey: key(),
+      });
+
+      // Raw phone/email/username have no accepted invite boundary field in this kernel. A hostile
+      // top-level smuggling attempt fails and reserves no idempotency record or Deal.
+      const rejectedActor = randomUUID();
+      const rejectedKey = key();
+      expect(
+        await errorCodeOf(() =>
+          createFormalDeal(pool, ports, {
+            actorPrincipalId: rejectedActor,
+            correlationId: randomUUID(),
+            dealType: 'GOODS',
+            creatorRole: 'BUYER',
+            counterpartyTarget: { kind: 'PENDING_INVITE', pendingInviteId: randomUUID() },
+            termsSchemaId: 'dhamani.goods.v1',
+            rawTerms: new TextEncoder().encode(
+              JSON.stringify({
+                common: { title: 'Invite boundary probe' },
+                typeTerms: {},
+                inviteEmail: piiSentinel,
+                invitePhone: phoneSentinel,
+                inviteUsername: usernameSentinel,
+              }),
+            ),
+            idempotencyKey: rejectedKey,
+          }),
+        ),
+      ).toBe('INVALID_TERMS_ENVELOPE');
+      const rejectedClaim = await pool.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM "ApplicationIdempotencyRecord"
+          WHERE "scope"=$1 AND "idempotencyKey"=$2`,
+        [`PRINCIPAL:${rejectedActor}`, rejectedKey],
+      );
+      expect(rejectedClaim.rows[0]!.count).toBe(0);
+
+      const audit = await pool.query<{ row: string }>(
+        `SELECT row_to_json(e)::text AS row FROM "DealAgreementAuditEvent" e WHERE "dealId"=$1`,
+        [born.dealId],
+      );
+      expect(audit.rowCount).toBeGreaterThan(0);
+      for (const row of audit.rows) {
+        expect(row.row).not.toContain(titleSentinel);
+        expect(row.row).not.toContain(contractSentinel);
+        expect(row.row).not.toContain(piiSentinel);
+        expect(row.row).not.toContain(phoneSentinel);
+        expect(row.row).not.toContain(usernameSentinel);
+      }
+
+      // The idempotency outcome likewise stores no terms content.
+      const stored = await pool.query<{ outcome: string }>(
+        `SELECT "outcome"::text AS outcome FROM "ApplicationIdempotencyRecord"
+          WHERE "outcome"->>'dealId' = $1`,
+        [born.dealId],
+      );
+      for (const row of stored.rows) {
+        expect(row.outcome).not.toContain(titleSentinel);
+        expect(row.outcome).not.toContain(contractSentinel);
+      }
+
+      // Contract terms themselves ARE persisted in the revision; invite-like PII sentinels are
+      // absent from the canonical bytes and every other kernel row.
+      const revision = await pool.query<{ text: string }>(
+        `SELECT convert_from("termsPayloadCanonicalBytes",'UTF8') AS text
+           FROM "AgreementRevision" WHERE "dealId"=$1`,
+        [born.dealId],
+      );
+      expect(revision.rows[0]!.text).toContain(titleSentinel);
+      expect(revision.rows[0]!.text).toContain(contractSentinel);
+      for (const pii of [piiSentinel, phoneSentinel, usernameSentinel])
+        expect(revision.rows[0]!.text).not.toContain(pii);
+
+      const slots = await pool.query<{ row: string }>(
+        `SELECT row_to_json(s)::text AS row FROM "DealPartySlot" s WHERE "dealId"=$1`,
+        [born.dealId],
+      );
+      expect(slots.rows.some((row) => row.row.includes(pendingInviteId))).toBe(true);
+      for (const row of slots.rows)
+        for (const pii of [piiSentinel, phoneSentinel, usernameSentinel])
+          expect(row.row).not.toContain(pii);
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(logs).toContain('request completed');
+      for (const sentinel of [
+        titleSentinel,
+        contractSentinel,
+        piiSentinel,
+        phoneSentinel,
+        usernameSentinel,
+      ])
+        expect(logs).not.toContain(sentinel);
+    } finally {
+      await app.close();
     }
-
-    // The idempotency outcome likewise stores no terms content.
-    const stored = await pool.query<{ outcome: string }>(
-      `SELECT "outcome"::text AS outcome FROM "ApplicationIdempotencyRecord"
-        WHERE "outcome"->>'dealId' = $1`,
-      [born.dealId],
-    );
-    for (const row of stored.rows) {
-      expect(row.outcome).not.toContain(titleSentinel);
-      expect(row.outcome).not.toContain(piiSentinel);
-    }
-
-    // The terms themselves ARE persisted in the revision — redaction applies to audit/logs only.
-    const revision = await pool.query<{ bytes: Buffer }>(
-      `SELECT "termsPayloadCanonicalBytes" AS bytes FROM "AgreementRevision" WHERE "dealId"=$1`,
-      [born.dealId],
-    );
-    expect(new TextDecoder().decode(revision.rows[0]!.bytes)).toContain(titleSentinel);
   });
 
   it('spec001_reads_require_authorized_actor_scope', async () => {

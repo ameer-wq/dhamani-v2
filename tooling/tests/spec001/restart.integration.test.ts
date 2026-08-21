@@ -2,7 +2,10 @@ import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_pr
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { createKernelDatabase } from '../../../apps/api/src/spec001/database.ts';
+import {
+  createKernelDatabase,
+  type KernelDatabase,
+} from '../../../apps/api/src/spec001/database.ts';
 import { acceptCurrentRevision } from '../../../apps/api/src/spec001/commands/accept-current-revision.ts';
 import { proposeChanges } from '../../../apps/api/src/spec001/commands/propose-changes.ts';
 import {
@@ -11,6 +14,7 @@ import {
   ports,
   randomUUID,
   requireConnectionString,
+  runtimeConnectionString,
   terms,
 } from './helpers.ts';
 
@@ -75,6 +79,47 @@ function docker(...args: string[]): string {
   return execFileSync('docker', args, { encoding: 'utf8', timeout: 120_000 }).trim();
 }
 
+/**
+ * Proves the container this test restarts is the PostgreSQL the application actually connects to.
+ *
+ * `system_identifier` is assigned at initdb and is unique per data directory, so comparing the
+ * value seen over the runtime TCP URL with the value read from inside the container is a positive
+ * identity match. Restarting a container that does not back the runtime URL would make the whole
+ * durability claim vacuous, and on a host running several project databases that mismatch is easy
+ * to create by accident.
+ */
+async function assertContainerBacksRuntimeUrl(pool: KernelDatabase): Promise<string> {
+  const overUrl = await pool.query<{ id: string }>(
+    'SELECT system_identifier::text AS id FROM pg_control_system()',
+  );
+  const url = new URL(requireConnectionString());
+  const inside = docker(
+    'exec',
+    CONTAINER,
+    'psql',
+    '-U',
+    decodeURIComponent(url.username),
+    '-d',
+    'postgres',
+    '-tAc',
+    'SELECT system_identifier::text FROM pg_control_system()',
+  );
+  expect(
+    inside,
+    `container ${CONTAINER} must back the runtime DATABASE_URL used by this evidence`,
+  ).toBe(overUrl.rows[0]!.id);
+  const publishedPort = docker(
+    'inspect',
+    '-f',
+    '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}',
+    CONTAINER,
+  );
+  expect(publishedPort, 'published host port must match the runtime DATABASE_URL').toBe(
+    url.port || '5432',
+  );
+  return inside;
+}
+
 function pause(ms: number): void {
   spawnSync(process.execPath, ['-e', `setTimeout(() => {}, ${ms})`], { timeout: ms + 5000 });
 }
@@ -85,6 +130,14 @@ function waitForContainerHealthy(): void {
     pause(1000);
   }
   throw new Error(`PostgreSQL container ${CONTAINER} did not become healthy after restart`);
+}
+
+function waitForReadinessStatus(expected: number): void {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (probeReadiness() === expected) return;
+    pause(500);
+  }
+  throw new Error(`application readiness did not become ${expected}`);
 }
 
 /** Probes the running application service's readiness endpoint out-of-process. */
@@ -114,10 +167,10 @@ function startApiService(): ServiceHandle {
   const child = spawn(
     process.execPath,
     [
-      join(process.cwd(), 'node_modules/tsx/dist/cli.mjs'),
-      // The API compiles with decorator metadata; without its own tsconfig Nest cannot bootstrap.
-      '--tsconfig',
-      'apps/api/tsconfig.json',
+      '--require',
+      './tooling/tests/spec001/node-userinfo-shim.cjs',
+      '--import',
+      'tsx',
       'apps/api/src/main.ts',
     ],
     {
@@ -125,7 +178,10 @@ function startApiService(): ServiceHandle {
       env: {
         ...process.env,
         DHAMANI_RUNTIME_MODE: 'test',
-        DATABASE_URL: requireConnectionString(),
+        // The actual service must use the constrained credential; owner/migration credentials
+        // are now correctly refused by /health/ready (§24.6).
+        DATABASE_URL: runtimeConnectionString(),
+        TSX_TSCONFIG_PATH: 'apps/api/tsconfig.json',
         DHAMANI_PRIVATE_SENTINEL: 'spec001-service-restart-sentinel',
         PORT: String(SERVICE_PORT),
       },
@@ -141,9 +197,7 @@ function startApiService(): ServiceHandle {
 }
 
 function stopApiService(service: ServiceHandle): void {
-  if (process.platform === 'win32')
-    spawnSync('taskkill', ['/pid', String(service.pid), '/T', '/F'], { timeout: 30_000 });
-  else service.child.kill('SIGTERM');
+  service.child.kill('SIGTERM');
   for (let attempt = 0; attempt < 30; attempt += 1) {
     if (probeReadiness() === 0) return;
     pause(500);
@@ -159,54 +213,72 @@ afterAll(async () => {
 
 describe('SPEC-001 durability across a real restart', () => {
   it('spec001_e33_real_restart_preserves_truth', async () => {
-    // ---- 1. the real application service starts; record its process identity ----
-    let service = startApiService();
-    const firstPid = service.pid;
-    expect(probeReadiness()).toBe(200);
-
-    // ---- 2. write real contractual truth ----
-    const deal = await bornDeal(pool, { title: 'Restart durability' });
-    await acceptCurrentRevision(pool, ports, {
-      actorPrincipalId: deal.counterpartyId,
-      correlationId: randomUUID(),
-      dealId: deal.dealId,
-      targetRevisionId: deal.revisionId,
-      idempotencyKey: randomUUID(),
-    });
-    const successor = await proposeChanges(pool, ports, {
-      actorPrincipalId: deal.counterpartyId,
-      correlationId: randomUUID(),
-      dealId: deal.dealId,
-      baseRevisionId: deal.revisionId,
-      termsSchemaId: 'dhamani.goods.v1',
-      rawTerms: terms('Restart durability', { amended: true }),
-      idempotencyKey: randomUUID(),
-    });
-
-    const before = await pool.query<SnapshotRow>(SNAPSHOT_SQL, [deal.dealId]);
-    expect(before.rowCount).toBe(1);
-    const snapshot = before.rows[0]!;
-
-    // ---- 3. the application service is actually stopped ----
-    stopApiService(service);
-    expect(probeReadiness()).toBe(0);
-
-    // ---- 4. PostgreSQL is actually restarted ----
-    await pool.end().catch(() => undefined);
-    const startedAt = docker('inspect', '-f', '{{.State.StartedAt}}', CONTAINER);
-    docker('restart', CONTAINER);
-    waitForContainerHealthy();
-    const restartedAt = docker('inspect', '-f', '{{.State.StartedAt}}', CONTAINER);
-    expect(restartedAt, 'PostgreSQL must genuinely have restarted').not.toBe(startedAt);
-
-    // ---- 5. the application service starts again with a DIFFERENT process identity ----
-    service = startApiService();
-    expect(service.pid, 'a real service restart means a new process').not.toBe(firstPid);
-    expect(probeReadiness(), 'readiness healthy after recovery').toBe(200);
-
+    let service: ServiceHandle | undefined;
+    let serviceRunning = false;
+    let postgresStopAttempted = false;
+    let cleanupFailure: unknown;
     try {
+      // ---- 0. the container restarted below must be the one backing the runtime URL ----
+      const clusterBefore = await assertContainerBacksRuntimeUrl(pool);
+
+      // ---- 1. the real application service starts; record its process identity ----
+      service = startApiService();
+      serviceRunning = true;
+      const firstPid = service.pid;
+      expect(probeReadiness()).toBe(200);
+
+      // ---- 2. write real contractual truth ----
+      const deal = await bornDeal(pool, { title: 'Restart durability' });
+      await acceptCurrentRevision(pool, ports, {
+        actorPrincipalId: deal.counterpartyId,
+        correlationId: randomUUID(),
+        dealId: deal.dealId,
+        targetRevisionId: deal.revisionId,
+        idempotencyKey: randomUUID(),
+      });
+      const successor = await proposeChanges(pool, ports, {
+        actorPrincipalId: deal.counterpartyId,
+        correlationId: randomUUID(),
+        dealId: deal.dealId,
+        baseRevisionId: deal.revisionId,
+        termsSchemaId: 'dhamani.goods.v1',
+        rawTerms: terms('Restart durability', { amended: true }),
+        idempotencyKey: randomUUID(),
+      });
+
+      const before = await pool.query<SnapshotRow>(SNAPSHOT_SQL, [deal.dealId]);
+      expect(before.rowCount).toBe(1);
+      const snapshot = before.rows[0]!;
+
+      // ---- 3. PostgreSQL stops while the same real application process remains live ----
+      await pool.end().catch(() => undefined);
+      const startedAt = docker('inspect', '-f', '{{.State.StartedAt}}', CONTAINER);
+      postgresStopAttempted = true;
+      docker('stop', CONTAINER);
+      expect(
+        probeReadiness(),
+        'the live application must fail readiness closed while PostgreSQL is stopped',
+      ).toBe(503);
+
+      // ---- 4. PostgreSQL starts again and the same application process recovers ----
+      docker('start', CONTAINER);
+      waitForContainerHealthy();
+      const restartedAt = docker('inspect', '-f', '{{.State.StartedAt}}', CONTAINER);
+      expect(restartedAt, 'PostgreSQL must genuinely have restarted').not.toBe(startedAt);
+      waitForReadinessStatus(200);
+
+      // ---- 5. the application service is actually restarted with a different PID ----
+      stopApiService(service);
+      serviceRunning = false;
+      service = startApiService();
+      serviceRunning = true;
+      expect(service.pid, 'a real service restart means a new process').not.toBe(firstPid);
+      expect(probeReadiness(), 'readiness healthy after recovery').toBe(200);
+
       // ---- 6. truth survives and is usable through the kernel boundary ----
       pool = createKernelDatabase(requireConnectionString());
+      // Recovery is the same cluster that was stopped, not a different reachable PostgreSQL.
+      expect(await assertContainerBacksRuntimeUrl(pool)).toBe(clusterBefore);
       const after = await pool.query<SnapshotRow>(SNAPSHOT_SQL, [deal.dealId]);
       expect(after.rowCount).toBe(1);
       const restored = after.rows[0]!;
@@ -234,8 +306,24 @@ describe('SPEC-001 durability across a real restart', () => {
       });
       expect(accepted.agreementReady).toBe(true);
     } finally {
-      stopApiService(service);
+      // A failed readiness assertion must never strand the shared PostgreSQL evidence service.
+      if (postgresStopAttempted) {
+        try {
+          docker('start', CONTAINER);
+          waitForContainerHealthy();
+        } catch (error) {
+          cleanupFailure = error;
+        }
+      }
+      if (service && serviceRunning) {
+        try {
+          stopApiService(service);
+        } catch (error) {
+          cleanupFailure ??= error;
+        }
+      }
     }
+    if (cleanupFailure) throw cleanupFailure;
   }, 600_000);
 
   it('spec001_restart_persistence_preserves_agreement_truth', async () => {

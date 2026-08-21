@@ -105,6 +105,12 @@ describe('SPEC-001 §11 canonicalization and accepted JSON domain', () => {
     );
     // Array order is data and must NOT be sorted.
     expect(canonicalOf('[3,1,2]')).toBe('[3,1,2]');
+
+    // Independent hard-coded digest (OpenSSL/sha256sum), deliberately stated inside the E34
+    // identity so this evidence cannot pass solely by delegating to another named test.
+    expect(sha256Hex(compact)).toBe(
+      'd3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772',
+    );
   });
 
   it('spec001_accepted_number_domain_matches_frozen_fixtures', () => {

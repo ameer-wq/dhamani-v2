@@ -104,7 +104,9 @@ export async function createFormalDeal(
   // §5.3 — a public-reference collision aborts the whole birth transaction, which is then retried
   // under the same semantic idempotency key with a newly generated reference and freshly
   // generated Deal/R1 ids. Only the identified reference unique violation is retryable here.
-  for (let attempt = 1; attempt <= MAX_REFERENCE_COLLISION_RETRIES; attempt += 1) {
+  // The initial birth attempt is followed by at most ten collision retries (§5.3): eleven total
+  // transactions only when every preceding attempt hit the identified reference constraint.
+  for (let attempt = 0; attempt <= MAX_REFERENCE_COLLISION_RETRIES; attempt += 1) {
     try {
       return await withTransaction(pool, (sql) =>
         birthTransaction(sql, ports, input, {
