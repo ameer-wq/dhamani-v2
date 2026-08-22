@@ -25,7 +25,28 @@ import {
  * process whose PID must change, and the PostgreSQL container's StartedAt must change. A test
  * that silently skipped either would be false-green evidence.
  */
-const CONTAINER = process.env.SPEC001_PG_CONTAINER ?? 'dhamani-spec001-pg';
+/**
+ * Resolves the PostgreSQL container this test restarts.
+ *
+ * Compose derives the container name from the project directory, so it is `dhamani-v2-postgres-1`
+ * on CI and `<worktree>-postgres-1` on a developer machine. A fixed name is therefore wrong
+ * everywhere except the one host it was written on; asking Compose which container backs the
+ * `postgres` service is the only resolution that holds in every environment, and it is exactly
+ * what `tooling/scripts/readiness-probe.ts` already does for the same reason.
+ *
+ * `SPEC001_PG_CONTAINER` still overrides it for a database provisioned outside this Compose
+ * project. Resolution fails closed: an unresolvable container throws rather than letting the
+ * restart evidence be skipped or silently pointed at some other PostgreSQL.
+ */
+function resolveContainer(): string {
+  const named = process.env.SPEC001_PG_CONTAINER;
+  const resolved = named ?? docker('compose', 'ps', '-q', 'postgres');
+  const container = resolved.split(/\r?\n/)[0]?.trim();
+  if (!container) throw new Error('no PostgreSQL container resolved for the restart evidence');
+  return container;
+}
+
+const CONTAINER = resolveContainer();
 const SERVICE_PORT = Number(process.env.SPEC001_SERVICE_PORT ?? 3011);
 
 const SNAPSHOT_SQL = `SELECT d."publicReference", d."currentRevisionId", d."version",
