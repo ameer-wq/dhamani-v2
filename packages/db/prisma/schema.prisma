@@ -1,8 +1,193 @@
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/client"
+  // Prisma 7 requires a driver adapter for a direct PostgreSQL connection; the official
+  // adapter (@prisma/adapter-pg) is used by the application runtime. Output stays in
+  // node_modules so no generated source enters the repository or a workspace rootDir.
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
+}
+
+// SPEC-001 Deal + Agreement Kernel.
+//
+// These models mirror the reviewed raw-SQL migrations. Several required guarantees cannot be
+// expressed in the Prisma schema language and live only in those migrations:
+//   - Deal(id, currentRevisionId) -> AgreementRevision(dealId, id) DEFERRABLE INITIALLY DEFERRED
+//   - append-only UPDATE/DELETE/TRUNCATE triggers on the contractual-history tables
+//   - the deferred exactly-two-complementary-slots constraint trigger
+//   - the exact pending-or-bound COUNTERPARTY state CHECK
+//   - column-level runtime GRANTs and least-privilege role separation
+//
+// Authoritative lifecycle timestamps intentionally carry no @default(now()) and no @updatedAt:
+// §29 requires them to come from the single post-lock clock_timestamp() of the command.
+
+enum DealType {
+  GOODS
+  SERVICES
+  BOOKING
+  SUBSCRIPTION
+  DIGITAL_ASSET
+}
+
+enum SlotKind {
+  CREATOR
+  COUNTERPARTY
+}
+
+enum PartyRole {
+  BUYER
+  SELLER
+  CLIENT
+  SERVICE_PROVIDER
+  CUSTOMER
+  BOOKING_PROVIDER
+  SUBSCRIBER
+  SUBSCRIPTION_PROVIDER
+}
+
+enum ResponseKind {
+  ACCEPT
+  REJECT
+}
+
+enum ResponseOrigin {
+  EXPLICIT
+  REVISION_CREATOR_AUTO
+}
+
+enum TerminationReason {
+  REJECTED
+  INVITATION_WITHDRAWN
+  NEGOTIATION_WITHDRAWN
+  INVITATION_EXPIRED
+}
+
+enum DealAuditEventType {
+  DEAL_CREATED
+  COUNTERPARTY_BOUND
+  REVISION_CREATED
+  REVISION_ACCEPTED_AUTO
+  REVISION_ACCEPTED_EXPLICIT
+  REVISION_REJECTED
+  CURRENT_REVISION_ADVANCED
+  MUTUAL_ACCEPTANCE_REACHED
+  INVITATION_WITHDRAWN
+  NEGOTIATION_WITHDRAWN
+  INVITATION_EXPIRED
+}
+
+model Deal {
+  id                    String             @id @db.Uuid
+  publicReference       String             @unique
+  dealType              DealType
+  /// Same-Deal integrity is enforced by a deferred composite FK in raw SQL, which Prisma's
+  /// schema language cannot express; it is deliberately not modelled as a Prisma relation.
+  currentRevisionId     String             @db.Uuid
+  sentAt                DateTime           @db.Timestamptz(6)
+  inviteExpiresAt       DateTime           @db.Timestamptz(6)
+  firstMutualAcceptedAt DateTime?          @db.Timestamptz(6)
+  terminationReason     TerminationReason?
+  terminatedAt          DateTime?          @db.Timestamptz(6)
+  version               Int
+  createdAt             DateTime           @db.Timestamptz(6)
+
+  revisions   AgreementRevision[]
+  partySlots  DealPartySlot[]
+  responses   RevisionResponse[]
+  auditEvents DealAgreementAuditEvent[]
+
+  @@unique([id, dealType])
+}
+
+model AgreementRevision {
+  id                              String   @id @db.Uuid
+  dealId                          String   @db.Uuid
+  revisionNumber                  Int
+  predecessorRevisionId           String?  @db.Uuid
+  createdByPrincipalId            String   @db.Uuid
+  termsSchemaId                   String
+  /// Authoritative RFC 8785 canonical UTF-8 payload bytes. Integrity is never recomputed from
+  /// any JSON/JSONB projection.
+  termsPayloadCanonicalBytes      Bytes
+  integrityPreimageCanonicalBytes Bytes
+  integrityFingerprint            Bytes
+  createdAt                       DateTime @db.Timestamptz(6)
+
+  deal        Deal                @relation(fields: [dealId], references: [id])
+  predecessor AgreementRevision?  @relation("RevisionChain", fields: [predecessorRevisionId], references: [id])
+  successors  AgreementRevision[] @relation("RevisionChain")
+  responses   RevisionResponse[]
+
+  @@unique([dealId, revisionNumber])
+  @@unique([dealId, id])
+  @@unique([id, dealId])
+}
+
+model DealPartySlot {
+  id              String    @id @db.Uuid
+  dealId          String    @db.Uuid
+  /// Immutable non-null enforcement copy of Deal.dealType, kept FK-consistent with the parent
+  /// Deal. It is not independent product state; it exists so role/type legality is checkable
+  /// by the database.
+  dealType        DealType
+  slotKind        SlotKind
+  role            PartyRole
+  principalId     String?   @db.Uuid
+  pendingInviteId String?   @db.Uuid
+  createdAt       DateTime  @db.Timestamptz(6)
+  boundAt         DateTime? @db.Timestamptz(6)
+
+  deal      Deal               @relation(fields: [dealId], references: [id])
+  responses RevisionResponse[]
+
+  @@unique([dealId, slotKind])
+  @@unique([dealId, principalId])
+}
+
+model RevisionResponse {
+  id             String         @id @db.Uuid
+  dealId         String         @db.Uuid
+  revisionId     String         @db.Uuid
+  principalId    String         @db.Uuid
+  responseKind   ResponseKind
+  responseOrigin ResponseOrigin
+  createdAt      DateTime       @db.Timestamptz(6)
+
+  deal      Deal              @relation(fields: [dealId], references: [id])
+  revision  AgreementRevision @relation(fields: [revisionId, dealId], references: [id, dealId])
+  partySlot DealPartySlot     @relation(fields: [dealId, principalId], references: [dealId, principalId])
+
+  @@unique([revisionId, principalId])
+}
+
+model DealAgreementAuditEvent {
+  id               String             @id @db.Uuid
+  dealId           String             @db.Uuid
+  eventType        DealAuditEventType
+  actorScope       String
+  targetRevisionId String?            @db.Uuid
+  commandTime      DateTime           @db.Timestamptz(6)
+  dealVersion      Int
+  correlationId    String             @db.Uuid
+  /// Safe metadata only. Full terms payloads, raw phone/email/username, tokens and request
+  /// bodies are never copied here (§26).
+  metadata         Json
+
+  deal Deal @relation(fields: [dealId], references: [id])
+
+  @@index([dealId, dealVersion])
+}
+
+model ApplicationIdempotencyRecord {
+  id                 String   @id @db.Uuid
+  scope              String
+  commandType        String
+  idempotencyKey     String
+  requestFingerprint Bytes
+  outcomeKind        String
+  outcome            Json
+  commandTime        DateTime? @db.Timestamptz(6)
+
+  @@unique([scope, commandType, idempotencyKey])
 }

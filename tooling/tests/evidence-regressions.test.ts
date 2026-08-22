@@ -196,3 +196,101 @@ describe('evidence registry fail-closed regressions', () => {
     expect(output).toContain(evidenceId);
   });
 });
+
+/**
+ * SPEC-001 evidence joins the frozen registry additively. These regressions prove the aggregate
+ * stays fail-closed for the new rows: a dropped invariant, a retargeted command, a missing
+ * earthquake identity or a missing R2 item must all be rejected.
+ */
+describe('SPEC-001 evidence registry remains fail-closed', () => {
+  it('accepts the committed manifest and covers every frozen SPEC-001 identity', () => {
+    const manifest = committedManifest();
+    expect(validateEvidenceManifest(manifest, rootScripts())).toEqual([]);
+
+    const invariantIds = Object.keys(manifest.invariants).filter((id) => id.startsWith('INV-001-'));
+    expect(invariantIds).toHaveLength(46);
+    expect(manifest.spec001RequiredEvidence?.earthquakeScenarios).toHaveLength(42);
+    expect(manifest.spec001RequiredEvidence?.r2CleanIncorporation).toHaveLength(4);
+
+    // Every declared identity is owned by a real, executable command in the execution order.
+    const all = [
+      ...invariantIds.flatMap((id) => manifest.invariants[id]!),
+      ...(manifest.spec001RequiredEvidence?.earthquakeScenarios ?? []),
+      ...(manifest.spec001RequiredEvidence?.r2CleanIncorporation ?? []),
+    ];
+    for (const id of all) {
+      const evidence = manifest.evidence[id];
+      expect(evidence, `${id} missing from evidence registry`).toBeDefined();
+      expect(commandOwnerExists(evidence!.command, rootScripts()), id).toBe(true);
+      expect(manifest.executionOrder).toContain(evidence!.command);
+    }
+  });
+
+  it('rejects a dropped SPEC-001 invariant row', () => {
+    const manifest = committedManifest();
+    delete manifest.invariants['INV-001-024'];
+    const errors = validateEvidenceManifest(manifest, rootScripts());
+    expect(errors.some((error) => error.includes('critical invariant registry differs'))).toBe(
+      true,
+    );
+  });
+
+  it('rejects a SPEC-001 invariant retargeted at a different command', () => {
+    const manifest = committedManifest();
+    manifest.evidence['spec001_e33_real_restart_preserves_truth'] = {
+      kind: 'automated_test',
+      command: 'pnpm lint',
+    };
+    manifest.invariants['INV-001-033'] = ['spec001_e33_real_restart_preserves_truth'];
+    const errors = validateEvidenceManifest(manifest, rootScripts());
+    expect(errors.some((error) => error.includes('INV-001-033'))).toBe(true);
+  });
+
+  it('rejects a missing earthquake scenario identity', () => {
+    const manifest = committedManifest();
+    manifest.spec001RequiredEvidence!.earthquakeScenarios =
+      manifest.spec001RequiredEvidence!.earthquakeScenarios.filter(
+        (id) => id !== 'spec001_e28_append_only_runtime_role_bypass_attacks',
+      );
+    const errors = validateEvidenceManifest(manifest, rootScripts());
+    expect(errors.some((error) => error.includes('earthquake evidence identities differ'))).toBe(
+      true,
+    );
+  });
+
+  it('rejects a missing R2 clean-incorporation item', () => {
+    const manifest = committedManifest();
+    manifest.spec001RequiredEvidence!.r2CleanIncorporation =
+      manifest.spec001RequiredEvidence!.r2CleanIncorporation.filter(
+        (id) => id !== 'spec001_raw_terms_cap_rejects_before_decode',
+      );
+    const errors = validateEvidenceManifest(manifest, rootScripts());
+    expect(errors.some((error) => error.includes('r2 evidence identities differ'))).toBe(true);
+  });
+
+  it('rejects removal of the whole SPEC-001 declaration block', () => {
+    const manifest = committedManifest();
+    delete manifest.spec001RequiredEvidence;
+    const errors = validateEvidenceManifest(manifest, rootScripts());
+    expect(errors).toContain('manifest declares no spec001RequiredEvidence block');
+  });
+
+  it('treats a skipped SPEC-001 evidence test as a failure, not a pass', () => {
+    const decision = evaluateEvidence(
+      'spec001_e01_formal_birth',
+      { kind: 'automated_test', command: 'pnpm test' },
+      rootScripts(),
+      new Map([['pnpm test', { exitCode: 0, output: '' }]]),
+      {
+        success: true,
+        numPendingTests: 1,
+        numTodoTests: 0,
+        testResults: [
+          { assertionResults: [{ fullName: 'suite spec001_e01_formal_birth', status: 'skipped' }] },
+        ],
+      },
+    );
+    expect(decision.pass).toBe(false);
+    expect(decision.executionStatus).toBe('skipped');
+  });
+});
