@@ -91,12 +91,12 @@
   },
   "executionOrder": [
     "pnpm install --frozen-lockfile",
+    "pnpm db:validate",
     "pnpm lint",
     "pnpm typecheck",
     "pnpm boundaries:check",
     "pnpm test",
     "pnpm build",
-    "pnpm db:validate",
     "pnpm secrets:check",
     "pnpm mobile:typecheck",
     "pnpm mobile:doctor",
